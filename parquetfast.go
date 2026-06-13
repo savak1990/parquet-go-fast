@@ -34,6 +34,9 @@ import (
 	"io"
 	"os"
 	"reflect"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/parquet-go/parquet-go"
@@ -43,10 +46,11 @@ import (
 type config struct {
 	batchSize   int
 	nullColSkip bool
+	concurrency int
 }
 
 func newConfig(opts []Option) config {
-	c := config{batchSize: 16, nullColSkip: true}
+	c := config{batchSize: 16, nullColSkip: true, concurrency: 1}
 	for _, o := range opts {
 		o(&c)
 	}
@@ -56,6 +60,16 @@ func newConfig(opts []Option) config {
 	}
 
 	return c
+}
+
+// workers resolves the requested concurrency to a positive worker count.
+// n <= 0 means GOMAXPROCS.
+func (c config) workers() int {
+	if c.concurrency <= 0 {
+		return runtime.GOMAXPROCS(0)
+	}
+
+	return c.concurrency
 }
 
 // Option customizes decoding.
@@ -71,6 +85,18 @@ func WithBatchSize(n int) Option {
 // read pipeline for columns proven 100% null in the file.
 func WithoutNullColumnSkip() Option {
 	return func(c *config) { c.nullColSkip = false }
+}
+
+// WithConcurrency decodes one file across n worker goroutines, each handling a
+// subset of the file's row groups and writing into a disjoint region of the
+// result. Default is 1 (sequential). n <= 0 means runtime.GOMAXPROCS.
+//
+// Speedup scales with the number of row groups: a single-row-group file is
+// always decoded sequentially. When n > 1, the io.ReaderAt passed to Unmarshal
+// MUST support concurrent ReadAt calls — *os.File and *bytes.Reader do, so
+// UnmarshalFile and UnmarshalBytes are always safe.
+func WithConcurrency(n int) Option {
+	return func(c *config) { c.concurrency = n }
 }
 
 // Unmarshal decodes every row of the parquet file in r into a []T. r must be an
@@ -128,6 +154,15 @@ func decodeFile[T any](f *parquet.File, cfg config) ([]T, error) {
 		return out[:0], nil
 	}
 
+	workers := cfg.workers()
+	if workers > 1 && len(rgs) > 1 {
+		if err := decodeConcurrent(rgs, plan, skip, out, cfg.batchSize, min(workers, len(rgs))); err != nil {
+			return nil, err
+		}
+
+		return out, nil
+	}
+
 	if err := decodeInto(rgs, plan, skip, out, cfg.batchSize); err != nil {
 		return nil, err
 	}
@@ -174,12 +209,97 @@ func openRows(rgs []parquet.RowGroup, skip []bool) parquet.Rows {
 	return parquet.MultiRowGroup(masked...).Rows()
 }
 
+// decodeConcurrent decodes the row groups across `workers` goroutines, each
+// pulling the next row group from a shared counter and writing into that group's
+// disjoint region of out. Requires the file's io.ReaderAt to support concurrent
+// ReadAt (parquet-go reads each row group through an independent SectionReader).
+func decodeConcurrent[T any](rgs []parquet.RowGroup, plan *Plan, skip []bool, out []T, batchSize, workers int) error {
+	// Per-row-group output offsets.
+	offsets := make([]int, len(rgs))
+	off := 0
+
+	for i, rg := range rgs {
+		offsets[i] = off
+		off += int(rg.NumRows())
+	}
+
+	var (
+		next     atomic.Int64
+		failed   atomic.Bool
+		errMu    sync.Mutex
+		firstErr error
+		wg       sync.WaitGroup
+	)
+
+	record := func(err error) {
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		errMu.Unlock()
+
+		failed.Store(true)
+	}
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			// Per-worker scratch, reused across the row groups this worker takes.
+			rowBatch := make([]parquet.Row, batchSize)
+			leafVals := make([][]parquet.Value, plan.NumLeaves())
+
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= len(rgs) || failed.Load() {
+					return
+				}
+
+				want := int(rgs[i].NumRows())
+				sub := out[offsets[i] : offsets[i]+want]
+
+				rows := NewMaskedRowGroup(rgs[i], skip).Rows()
+				read, err := decodeRowsInto(rows, plan, sub, rowBatch, leafVals)
+
+				if cerr := rows.Close(); cerr != nil && err == nil {
+					err = fmt.Errorf("close parquet rows: %w", cerr)
+				}
+
+				if err != nil {
+					record(err)
+
+					return
+				}
+
+				if read != want {
+					record(fmt.Errorf("row group %d: decoded %d rows but group reports %d", i, read, want))
+
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	return firstErr
+}
+
 // decodeAllRows pulls rows in batches and applies plan to each, writing in place
 // into out. Returns the number of rows decoded.
 func decodeAllRows[T any](rows parquet.Rows, plan *Plan, out []T, batchSize int) (int, error) {
 	rowBatch := make([]parquet.Row, batchSize)
 	leafVals := make([][]parquet.Value, plan.NumLeaves())
 
+	return decodeRowsInto(rows, plan, out, rowBatch, leafVals)
+}
+
+// decodeRowsInto pulls rows in batches using caller-provided scratch buffers and
+// applies plan to each, writing in place into out. Returns the number decoded.
+// Workers reuse their own buffers across row groups via this entry point.
+func decodeRowsInto[T any](rows parquet.Rows, plan *Plan, out []T, rowBatch []parquet.Row, leafVals [][]parquet.Value) (int, error) {
 	read := 0
 
 	for {

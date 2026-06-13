@@ -95,6 +95,25 @@ for {
 once the file is exhausted. Working memory stays bounded by `len(buf)` regardless
 of file size.
 
+## Concurrent decoding
+
+Decode one file across multiple cores by fanning its row groups out to worker
+goroutines — opt in with `WithConcurrency`:
+
+```go
+rows, err := parquetfast.UnmarshalFile[Row]("big.parquet", parquetfast.WithConcurrency(0))
+```
+
+`WithConcurrency(n)` uses `n` workers; `n <= 0` means `GOMAXPROCS`; the default
+(`1`) is sequential. Each worker decodes whole row groups into disjoint regions
+of the result, so there's no locking on the hot path. **Speedup scales with the
+number of row groups** — a single-row-group file is always decoded sequentially.
+On a 16-row-group fixture this is ~3× faster than sequential.
+
+When `n > 1`, the `io.ReaderAt` passed to `Unmarshal` must support concurrent
+`ReadAt` calls. `*os.File` and `*bytes.Reader` do, so `UnmarshalFile` and
+`UnmarshalBytes` are always safe; only a custom `io.ReaderAt` needs checking.
+
 ---
 
 ## How it works
@@ -149,20 +168,24 @@ reflect fallback otherwise · `reflect` = reflect on the hot path ·
 | `uint8, uint16, uint32, uint64` | typed inline | widen from INT32/INT64 |
 | `float32, float64` | typed inline | |
 | `[]byte` | typed inline | BYTE_ARRAY → byte copy |
+| `time.Time` | typed inline | TIMESTAMP (ms/µs/ns) or DATE → UTC instant |
 | **Optional scalars (`*T`)** | | |
 | `*string, *bool, *int…, *uint…, *float…` | typed inline | nil on null/absent |
 | `*[]byte` | typed inline | optional BYTE_ARRAY |
+| `*time.Time` | typed inline | nil on null/absent |
 | **Structs** | | |
 | `struct{…}` | typed inline | embedded at parent offset |
 | `*struct{…}` | typed fast path | `RegisterStructAlloc[T]`, else `reflect.New` |
 | **Primitive slices** | | |
 | `[]string, []bool, []int…, []uint16/32/64, []float…` | typed inline | both `repeated` and `,list` layouts |
+| `[]time.Time` | typed inline | TIMESTAMP/DATE elements |
 | **Struct slices** | | |
 | `[]Struct` | typed fast path | `RegisterStructList[T]`, else `reflect.MakeSlice` |
 | **Maps — `map[K]primitive`** | | |
 | `map[string]string`, `map[string]int64`, `map[int64]float64` | typed inline | |
 | other `map[K]V` primitive | reflect | K ∈ {string,int32,int64,float64}; V primitive incl. bool |
 | **Maps — `map[K]Struct`** | typed fast path | `RegisterStructValuedMap[K,V]`, else reflect |
+| **Maps — `map[K]time.Time`** | reflect | time value is a single leaf |
 | **Nested maps — `map[K1]map[K2]V`** | reflect | inner V primitive |
 
 ### Not supported (errors at `Compile`)
@@ -296,8 +319,16 @@ go test -run='^$' -bench='BenchmarkDecode|BenchmarkMerchantDecode|BenchmarkPlanA
   `,optional`-tagged) fields where the distinction matters.
 - **Multi-row-group files** are supported (each group is masked for all-null
   columns, then combined via `parquet.MultiRowGroup`).
-- **Concurrency.** A compiled `Plan` is read-only and safe to share. A `Reader`
-  is not safe for concurrent use; create one per goroutine.
+- **`time.Time`** decodes to the absolute instant in **UTC** (parquet stores an
+  epoch value; the column's adjusted-to-UTC flag affects only display). Compare
+  decoded times with `.Equal`, not `==`/`reflect.DeepEqual` — Go has multiple
+  internal representations for the same instant. Float/byte-array timestamp
+  encodings are a `Compile` error rather than a silent mis-decode.
+- **Concurrency.** A compiled `Plan` is read-only and safe to share across
+  goroutines. `Unmarshal` with `WithConcurrency(n>1)` decodes one file across
+  cores (needs a concurrent-safe `io.ReaderAt`; see
+  [Concurrent decoding](#concurrent-decoding)). A single `Reader` is not safe for
+  concurrent use; create one per goroutine.
 
 ---
 

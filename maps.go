@@ -18,6 +18,12 @@ import (
 
 // addMapField dispatches a map[K]V Go field to the right registrar.
 func addMapField(plan *Plan, mt reflect.Type, offset uintptr, path []string, schema *parquet.Schema) error {
+	// time.Time as a map value is a single leaf, not a struct subtree — route it
+	// before the generic struct-valued-map handling.
+	if mt.Elem() == timeType {
+		return addTimeValuedMap(plan, mt, offset, path, schema)
+	}
+
 	switch mt.Elem().Kind() {
 	case reflect.Struct:
 		return addStructValuedMap(plan, mt, offset, path, schema)

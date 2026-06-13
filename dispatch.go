@@ -1,6 +1,7 @@
 package parquetfast
 
 import (
+	"time"
 	"unsafe"
 
 	"github.com/parquet-go/parquet-go"
@@ -33,6 +34,14 @@ const (
 	kindFloat64
 	kindBytes
 
+	// time.Time fields. The stored value is always an absolute instant
+	// (Unix epoch), so reconstruction is unit-dependent but zone-independent
+	// (always materialized in UTC). The unit is resolved once at plan-build.
+	kindTimeNanos
+	kindTimeMillis
+	kindTimeMicros
+	kindTimeDate
+
 	// Optional scalars (*T): write a fresh pointer-to-value, or nil on a null
 	// parquet value / an absent column. Every optional kind sorts at or above
 	// firstOptKind so the "absent column" branch can detect optionals with a
@@ -51,7 +60,16 @@ const (
 	kindOptFloat32
 	kindOptFloat64
 	kindOptBytes
+
+	// Optional time.Time (*time.Time).
+	kindOptTimeNanos
+	kindOptTimeMillis
+	kindOptTimeMicros
+	kindOptTimeDate
 )
+
+// secondsPerDay converts a DATE column's day count to seconds for time.Unix.
+const secondsPerDay = 86400
 
 // firstOptKind is the boundary between required and optional kinds. A kind
 // >= firstOptKind writes a pointer field and must be cleared to nil when its
@@ -128,6 +146,12 @@ func applyScalar(kind setterKind, dst unsafe.Pointer, v parquet.Value) {
 		// []byte clears to nil on null (unlike numeric scalars which no-op),
 		// then copies off the reusable parquet-go page buffer.
 		*(*[]byte)(dst) = copyBytes(v)
+
+	// ── time.Time ─────────────────────────────────────────────────────
+	case kindTimeNanos, kindTimeMillis, kindTimeMicros, kindTimeDate:
+		if !v.IsNull() {
+			*(*time.Time)(dst) = decodeTimeValue(kind, v)
+		}
 
 	// ── optional scalars (*T) ─────────────────────────────────────────
 	case kindOptString:
@@ -228,6 +252,29 @@ func applyScalar(kind setterKind, dst unsafe.Pointer, v parquet.Value) {
 			b := copyBytes(v)
 			*(**[]byte)(dst) = &b
 		}
+	case kindOptTimeNanos, kindOptTimeMillis, kindOptTimeMicros, kindOptTimeDate:
+		if v.IsNull() {
+			*(**time.Time)(dst) = nil
+		} else {
+			t := decodeTimeValue(kind, v)
+			*(**time.Time)(dst) = &t
+		}
+	}
+}
+
+// decodeTimeValue reconstructs a time.Time from a leaf value for the given time
+// setter kind. The stored value is always an absolute Unix instant, so the
+// result is materialized in UTC regardless of the column's adjusted-to-UTC flag.
+func decodeTimeValue(kind setterKind, v parquet.Value) time.Time {
+	switch kind {
+	case kindTimeMillis, kindOptTimeMillis:
+		return time.UnixMilli(v.Int64()).UTC()
+	case kindTimeMicros, kindOptTimeMicros:
+		return time.UnixMicro(v.Int64()).UTC()
+	case kindTimeDate, kindOptTimeDate:
+		return time.Unix(int64(v.Int32())*secondsPerDay, 0).UTC()
+	default: // kindTimeNanos / kindOptTimeNanos
+		return time.Unix(0, v.Int64()).UTC()
 	}
 }
 

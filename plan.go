@@ -230,6 +230,13 @@ func addStructFields(plan *Plan, rt reflect.Type, baseOffset uintptr, pathPrefix
 
 // addFieldByKind dispatches a Go field type to the right plan-builder.
 func addFieldByKind(plan *Plan, ft reflect.Type, offset uintptr, path []string, schema *parquet.Schema) error {
+	// time.Time is a struct but maps to a single timestamp/date leaf — intercept
+	// it before the generic struct handling would recurse into its unexported
+	// fields and decode nothing.
+	if ft == timeType {
+		return addTimeLeaf(plan, offset, path, schema, false)
+	}
+
 	if kind, ok := scalarKindFor(ft.Kind()); ok {
 		return addScalarLeaf(plan, offset, path, schema, kind)
 	}
@@ -242,6 +249,11 @@ func addFieldByKind(plan *Plan, ft reflect.Type, offset uintptr, path []string, 
 		// a narrow int but a []uint8 field is a byte string.
 		if elem.Kind() == reflect.Uint8 {
 			return addScalarLeaf(plan, offset, path, schema, kindBytes)
+		}
+
+		// time.Time is a struct but maps to a single timestamp leaf per element.
+		if elem == timeType {
+			return addTimeList(plan, offset, path, schema)
 		}
 
 		if elem.Kind() == reflect.Struct {
@@ -257,6 +269,10 @@ func addFieldByKind(plan *Plan, ft reflect.Type, offset uintptr, path []string, 
 		return addMapField(plan, ft, offset, path, schema)
 	case reflect.Ptr:
 		elem := ft.Elem()
+		if elem == timeType {
+			return addTimeLeaf(plan, offset, path, schema, true)
+		}
+
 		if elem.Kind() == reflect.Struct {
 			return addOptionalStruct(plan, elem, offset, path, schema)
 		}
