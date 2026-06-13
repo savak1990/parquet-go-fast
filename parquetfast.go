@@ -1,0 +1,257 @@
+// Package parquetfast is a high-performance, reflection-free-on-the-hot-path
+// parquet decoder.
+//
+// It compiles a Go struct + parquet schema into a flat plan once (Compile),
+// then decodes each row by writing through unsafe.Pointer at precompiled field
+// offsets (Plan.Apply) — no schema conversion, no per-row reflection. Compared
+// to parquet-go's reflection-driven GenericReader it is markedly faster and
+// allocates far less, because the reflection walk happens once per (Go type,
+// schema) shape instead of per row.
+//
+// Quickstart:
+//
+//	type Row struct {
+//	    Name   string            `parquet:"name"`
+//	    Count  int64             `parquet:"count"`
+//	    Labels map[string]string `parquet:"labels"`
+//	}
+//
+//	rows, err := parquetfast.UnmarshalBytes[Row](data)
+//
+// The struct tags are the same `parquet:"..."` tags parquet-go's writer reads,
+// so a file written by parquet.GenericWriter[Row] round-trips through
+// UnmarshalBytes[Row].
+//
+// It depends only on github.com/parquet-go/parquet-go (no fork, no replace
+// directive) and reads files written by any spec-conformant writer (parquet-go,
+// Arrow, Spark, DuckDB, …).
+package parquetfast
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"reflect"
+	"unsafe"
+
+	"github.com/parquet-go/parquet-go"
+)
+
+// config holds decode options.
+type config struct {
+	batchSize   int
+	nullColSkip bool
+}
+
+func newConfig(opts []Option) config {
+	c := config{batchSize: 16, nullColSkip: true}
+	for _, o := range opts {
+		o(&c)
+	}
+
+	if c.batchSize < 1 {
+		c.batchSize = 16
+	}
+
+	return c
+}
+
+// Option customizes decoding.
+type Option func(*config)
+
+// WithBatchSize sets the number of rows pulled from parquet-go per ReadRows call
+// (default 16, the value benchmarks favored across file sizes).
+func WithBatchSize(n int) Option {
+	return func(c *config) { c.batchSize = n }
+}
+
+// WithoutNullColumnSkip disables the optimization that bypasses parquet-go's
+// read pipeline for columns proven 100% null in the file.
+func WithoutNullColumnSkip() Option {
+	return func(c *config) { c.nullColSkip = false }
+}
+
+// Unmarshal decodes every row of the parquet file in r into a []T. r must be an
+// io.ReaderAt of exactly size bytes (e.g. *bytes.Reader, *os.File).
+func Unmarshal[T any](r io.ReaderAt, size int64, opts ...Option) ([]T, error) {
+	f, err := parquet.OpenFile(r, size)
+	if err != nil {
+		return nil, fmt.Errorf("open parquet file: %w", err)
+	}
+
+	return decodeFile[T](f, newConfig(opts))
+}
+
+// UnmarshalBytes is Unmarshal over an in-memory parquet file.
+func UnmarshalBytes[T any](b []byte, opts ...Option) ([]T, error) {
+	return Unmarshal[T](bytes.NewReader(b), int64(len(b)), opts...)
+}
+
+func decodeFile[T any](f *parquet.File, cfg config) ([]T, error) {
+	rt := reflect.TypeFor[T]()
+	rgs := f.RowGroups()
+
+	var skip []bool
+	if cfg.nullColSkip {
+		skip = allNullCols(rgs, f.Schema())
+	}
+
+	plan, err := Compile(rt, f.Schema(), skip)
+	if err != nil {
+		return nil, fmt.Errorf("build plan for %s: %w", rt.Name(), err)
+	}
+
+	total := int(f.NumRows())
+	out := make([]T, total)
+
+	if total == 0 || len(rgs) == 0 {
+		return out[:0], nil
+	}
+
+	if err := decodeInto(rgs, plan, skip, out, cfg.batchSize); err != nil {
+		return nil, err
+	}
+
+	return out, nil
+}
+
+// decodeInto opens the (masked, possibly multi-) row-group stream and decodes
+// every row into out, verifying the row count.
+func decodeInto[T any](rgs []parquet.RowGroup, plan *Plan, skip []bool, out []T, batchSize int) (err error) {
+	rows := openRows(rgs, skip)
+
+	defer func() {
+		if cerr := rows.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("close parquet rows: %w", cerr)
+		}
+	}()
+
+	read, err := decodeAllRows(rows, plan, out, batchSize)
+	if err != nil {
+		return err
+	}
+
+	if read != len(out) {
+		return fmt.Errorf("decoded %d rows but file reports %d (possible file corruption)", read, len(out))
+	}
+
+	return nil
+}
+
+// openRows returns a row reader over rgs with 100%-null columns masked out.
+// Single-row-group files take a direct path; multi-row-group files are combined
+// via parquet.MultiRowGroup after each group is masked.
+func openRows(rgs []parquet.RowGroup, skip []bool) parquet.Rows {
+	if len(rgs) == 1 {
+		return NewMaskedRowGroup(rgs[0], skip).Rows()
+	}
+
+	masked := make([]parquet.RowGroup, len(rgs))
+	for i, rg := range rgs {
+		masked[i] = NewMaskedRowGroup(rg, skip)
+	}
+
+	return parquet.MultiRowGroup(masked...).Rows()
+}
+
+// decodeAllRows pulls rows in batches and applies plan to each, writing in place
+// into out. Returns the number of rows decoded.
+func decodeAllRows[T any](rows parquet.Rows, plan *Plan, out []T, batchSize int) (int, error) {
+	rowBatch := make([]parquet.Row, batchSize)
+	leafVals := make([][]parquet.Value, plan.NumLeaves())
+
+	read := 0
+
+	for {
+		n, rerr := rows.ReadRows(rowBatch)
+		for i := 0; i < n; i++ {
+			if read+i >= len(out) {
+				return read + i, fmt.Errorf("decoded rows exceed pre-allocated buffer of %d (possibly corrupted file)", len(out))
+			}
+
+			plan.Apply(unsafe.Pointer(&out[read+i]), rowBatch[i], leafVals)
+		}
+
+		read += n
+
+		if rerr != nil {
+			if !errors.Is(rerr, io.EOF) {
+				return read, fmt.Errorf("read parquet rows: %w", rerr)
+			}
+
+			// rowGroupRows.ReadRows reports io.EOF as soon as ANY column's value
+			// stream is exhausted, even when sibling columns still hold rows for
+			// this batch and beyond. Treat EOF as terminal only when the call
+			// made no progress, so trailing rows are drained instead of dropped.
+			if n == 0 {
+				return read, nil
+			}
+		}
+	}
+}
+
+// allNullCols returns a bitmap of leaf columns proven 100% null across every row
+// group, or nil if none qualify.
+func allNullCols(rgs []parquet.RowGroup, schema *parquet.Schema) []bool {
+	if len(rgs) == 0 {
+		return nil
+	}
+
+	numLeaves := len(schema.Columns())
+	skip := make([]bool, numLeaves)
+
+	for col := range numLeaves {
+		all := true
+
+		for _, rg := range rgs {
+			if !isColumnAllNull(rg, col) {
+				all = false
+
+				break
+			}
+		}
+
+		skip[col] = all
+	}
+
+	if !anyTrue(skip) {
+		return nil
+	}
+
+	return skip
+}
+
+func isColumnAllNull(rg parquet.RowGroup, col int) bool {
+	chunks := rg.ColumnChunks()
+	if col >= len(chunks) {
+		return false
+	}
+
+	cc := chunks[col]
+	if fcc, ok := cc.(*parquet.FileColumnChunk); ok {
+		return fcc.NullCount() >= fcc.NumValues()
+	}
+
+	ci, err := cc.ColumnIndex()
+	if err != nil || ci == nil {
+		return false
+	}
+
+	var nulls int64
+	for p := range ci.NumPages() {
+		nulls += ci.NullCount(p)
+	}
+
+	return nulls >= cc.NumValues()
+}
+
+func anyTrue(b []bool) bool {
+	for _, v := range b {
+		if v {
+			return true
+		}
+	}
+
+	return false
+}
