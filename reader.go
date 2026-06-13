@@ -103,7 +103,14 @@ func (rd *Reader[T]) Read(dst []T) (int, error) {
 	batch := rd.batch[:len(dst)]
 
 	n, rerr := rd.rows.ReadRows(batch)
+
+	// Apply fills present fields and leaves absent fields at the Go zero value;
+	// it does not clear stale data. Since dst is reused across Read calls, each
+	// slot must be reset first, or maps/slices from a prior row would leak in.
+	var zero T
+
 	for i := 0; i < n; i++ {
+		dst[i] = zero
 		rd.plan.Apply(unsafe.Pointer(&dst[i]), batch[i], rd.leafVals)
 	}
 

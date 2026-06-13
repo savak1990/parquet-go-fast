@@ -198,10 +198,18 @@ bytes, −41% allocations**.
 at once, so its byte count reflects the full result set, not steady-state
 working memory. Use `Reader` when you don't need every row resident.
 
+The gap is workload-dependent. On a deliberately extreme record (a wide
+e-commerce rollup with a high-cardinality `map[string]Struct`, a nested map, a
+struct slice, and several `[]byte` blobs — `BenchmarkMerchantDecode`), streaming
+is **−37% time, −19% allocations**, though total bytes run slightly higher than
+`GenericReader` because each row allocates many small maps/structs either way.
+Time and allocation count win across the board; raw bytes are close on the most
+map-dense shapes.
+
 Reproduce:
 
 ```sh
-go test -run='^$' -bench='BenchmarkDecode|BenchmarkPlanApply' -benchmem
+go test -run='^$' -bench='BenchmarkDecode|BenchmarkMerchantDecode|BenchmarkPlanApply' -benchmem
 ```
 
 ---
@@ -225,6 +233,23 @@ go test -run='^$' -bench='BenchmarkDecode|BenchmarkPlanApply' -benchmem
   is not safe for concurrent use; create one per goroutine.
 
 ---
+
+## Testing
+
+The suite encodes with `parquet-go`'s `GenericWriter` and decodes back with this
+library (`reflect.DeepEqual` gate), covering every supported shape in isolation
+plus two production-shaped records from an unrelated domain (e-commerce /
+logistics rollups: a wide record with a high-cardinality struct-valued map, a
+nested map, a struct slice, optional struct chains, and `[]byte` blobs). Two
+scale tests generate **one-million-row, multi-row-group files** on disk and
+stream-decode them end to end, checking order-independent aggregates so a
+dropped, duplicated, or corrupted row is caught without holding every row in
+memory. All fixtures are synthetic.
+
+```sh
+go test ./...            # full suite, incl. the million-row scale tests
+go test -short ./...     # skips the million-row tests
+```
 
 ## License
 

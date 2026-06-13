@@ -77,6 +77,12 @@ func (p *Plan) hasBindings() bool {
 //	row      — a flat sequence of parquet.Value for one logical row.
 //	leafVals — caller-owned scratch buffer of length NumLeaves(). Reused across
 //	           rows; contents are overwritten on each call.
+//
+// The destination MUST be zero-valued. Apply fills the fields present in the row
+// and leaves absent fields at the Go zero value; it does not clear pre-existing
+// data. Applying into a dirty struct (e.g. a reused slot) can leak a prior row's
+// maps/slices/values. Unmarshal pre-allocates fresh slots; the streaming Reader
+// zeroes each slot before Apply.
 func (p *Plan) Apply(base unsafe.Pointer, row parquet.Row, leafVals [][]parquet.Value) {
 	unflattenRow(row, leafVals)
 	p.applyDecoded(base, leafVals)
