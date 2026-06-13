@@ -150,12 +150,22 @@ reflect fallback otherwise · `reflect` = reflect on the hot path ·
 
 ### Not supported (errors at `Compile`)
 
-| Go field type | Why |
-|---|---|
-| `[]*T` | pointer-element slices — use `[]T` |
-| `map[K][]V`, `[]map[K]V`, `map[K][]Struct` | mixed nesting: two repetition levels with no struct dispatch boundary |
-| `map[K1]map[K2]Struct` | nested struct-valued maps |
-| `complex`, `chan`, `func`, `interface`, arrays | not representable in parquet |
+| Go field type | Why | Use instead |
+|---|---|---|
+| `[]*T` | pointer-element slices | `[]T` |
+| `map[K][]V` | mixed nesting: two repetition levels with no struct dispatch boundary | `map[K]struct{ Items []V }` |
+| `[]map[K]V` | same | `[]struct{ M map[K]V }` |
+| `map[K][]Struct` | same | `map[K]struct{ Items []Struct }` |
+| `map[K1]map[K2]Struct` | nested struct-valued maps | `map[K1]struct{ Inner map[K2]Struct }` |
+
+The fix for every mixed-nesting case is the same: wrap the inner collection in a
+named struct, which gives the decoder a struct boundary between the two
+repetition levels. For example, instead of `map[string][]int64` use:
+
+```go
+type Bucket struct { Values []int64 `parquet:"values"` }
+M map[string]Bucket `parquet:"m"`
+```
 
 ---
 
