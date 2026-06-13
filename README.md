@@ -41,7 +41,8 @@ enum-switch. The reflection happens once, at plan-build time, and is cached.
 
 ## Quickstart
 
-Use the same `parquet:"..."` struct tags `parquet-go`'s writer uses:
+Use the same `parquet:"..."` struct tags `parquet-go`'s writer uses, then make
+one call that returns `[]T`:
 
 ```go
 type Row struct {
@@ -52,17 +53,29 @@ type Row struct {
     Labels map[string]string `parquet:"labels"`
 }
 
-// One-shot: decode the whole file into a slice.
+// From a file on disk:
+rows, err := parquetfast.UnmarshalFile[Row]("data.parquet")
+
+// From an in-memory file:
 rows, err := parquetfast.UnmarshalBytes[Row](data)
 
-// Or from any io.ReaderAt (e.g. *os.File):
-f, _ := os.Open("data.parquet")
-fi, _ := f.Stat()
-rows, err := parquetfast.Unmarshal[Row](f, fi.Size())
+// From any io.ReaderAt of a known size:
+rows, err := parquetfast.Unmarshal[Row](r, size)
 ```
 
-For large files, stream in caller-sized batches with a reused destination
-instead of materializing every row at once:
+That's it — all the row-group iteration and batched reads happen inside the
+library. See [Large files](#large-files) if you'd rather stream than hold the
+whole result set in memory.
+
+> If your rows contain nested structs, struct slices, or struct-valued maps,
+> register them once in `init()` for a faster, allocation-light decode path —
+> see [Typed fast-path registration](#typed-fast-path-registration). It's
+> optional: everything decodes correctly without it.
+
+## Large files
+
+For files too big to hold the whole `[]T` in memory, stream with a reused
+destination buffer instead:
 
 ```go
 rd, err := parquetfast.NewReader[Row](f, size)
@@ -77,6 +90,10 @@ for {
     if err != nil { return err }
 }
 ```
+
+`Read` fills the buffer, returns how many rows it wrote, and reports `io.EOF`
+once the file is exhausted. Working memory stays bounded by `len(buf)` regardless
+of file size.
 
 ---
 
@@ -174,17 +191,57 @@ M map[string]Bucket `parquet:"m"`
 All three registries are **optional** performance knobs. Unregistered types
 decode correctly via a reflect fallback; registering swaps in a generic-typed
 path that avoids `reflect.New` / `reflect.MakeSlice` / `reflect.MakeMapWithSize`
-/ `SetMapIndex` per entry. Call them once from an `init()`:
+/ `SetMapIndex` per entry.
+
+| Field shape | Register | What it replaces |
+|---|---|---|
+| `*Struct` (optional struct) | `RegisterStructAlloc[Struct]()` | `reflect.New` per row |
+| `[]Struct` (struct slice) | `RegisterStructList[Struct]()` | `reflect.MakeSlice` + `Value.Index` per entry |
+| `map[K]Struct` (struct-valued map) | `RegisterStructValuedMap[K, Struct](keyDecode)` | `reflect.New` + `SetMapIndex` per entry |
+
+Worked example — a record using all three, registered once in `init()`, then
+decoded with a single call:
 
 ```go
+type Address struct {
+    City string `parquet:"city"`
+    Zip  string `parquet:"zip"`
+}
+
+type LineItem struct {
+    SKU string `parquet:"sku"`
+    Qty int64  `parquet:"qty"`
+}
+
+type Container struct {
+    Name  string `parquet:"name"`
+    Count int64  `parquet:"count"`
+}
+
+type Order struct {
+    ID         string               `parquet:"id"`
+    ShipTo     *Address             `parquet:"ship_to,optional"`  // optional struct
+    Items      []LineItem           `parquet:"items"`             // struct slice
+    Containers map[string]Container `parquet:"containers"`        // struct-valued map
+}
+
 func init() {
-    parquetfast.RegisterStructAlloc[Address]()                 // *Address fields
-    parquetfast.RegisterStructList[LineItem]()                 // []LineItem fields
-    parquetfast.RegisterStructValuedMap[string, Container](    // map[string]Container fields
+    parquetfast.RegisterStructAlloc[Address]()
+    parquetfast.RegisterStructList[LineItem]()
+    parquetfast.RegisterStructValuedMap[string, Container](
         func(v parquet.Value) string { return string(v.ByteArray()) },
     )
 }
+
+func loadOrders(path string) ([]Order, error) {
+    return parquetfast.UnmarshalFile[Order](path) // registrations apply automatically
+}
 ```
+
+The `keyDecode` callback for `RegisterStructValuedMap` decodes the map key from a
+`parquet.Value` (you know the key's parquet kind): `v.ByteArray()` for string
+keys, `v.Int64()` for `int64`, `v.Int32()` for `int32`, `v.Double()` for
+`float64`.
 
 ---
 

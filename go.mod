@@ -1,6 +1,6 @@
 module github.com/savak1990/parquet-go-fast
 
-go 1.25.0
+go 1.26.0
 
 require github.com/parquet-go/parquet-go v0.30.1
 

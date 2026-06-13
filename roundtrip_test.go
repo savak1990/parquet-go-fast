@@ -2,6 +2,8 @@ package parquetfast_test
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -212,5 +214,27 @@ func TestEmpty(t *testing.T) {
 
 	if len(got) != 0 {
 		t.Fatalf("expected 0 rows, got %d", len(got))
+	}
+}
+
+func TestUnmarshalFile(t *testing.T) {
+	rows := []scalarRow{
+		{S: "a", I64: 1, Bs: []byte{1}},
+		{S: "b", I64: 2, Bs: []byte{2}},
+	}
+	buf := writeGeneric(t, rows)
+
+	path := filepath.Join(t.TempDir(), "f.parquet")
+	if err := os.WriteFile(path, buf, 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	got, err := parquetfast.UnmarshalFile[scalarRow](path)
+	if err != nil {
+		t.Fatalf("UnmarshalFile: %v", err)
+	}
+
+	if !reflect.DeepEqual(rows, got) {
+		t.Fatalf("mismatch:\n want %#v\n got  %#v", rows, got)
 	}
 }

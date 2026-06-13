@@ -16,7 +16,7 @@
 //	    Labels map[string]string `parquet:"labels"`
 //	}
 //
-//	rows, err := parquetfast.UnmarshalBytes[Row](data)
+//	rows, err := parquetfast.UnmarshalFile[Row]("data.parquet")
 //
 // The struct tags are the same `parquet:"..."` tags parquet-go's writer reads,
 // so a file written by parquet.GenericWriter[Row] round-trips through
@@ -32,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"reflect"
 	"unsafe"
 
@@ -86,6 +87,24 @@ func Unmarshal[T any](r io.ReaderAt, size int64, opts ...Option) ([]T, error) {
 // UnmarshalBytes is Unmarshal over an in-memory parquet file.
 func UnmarshalBytes[T any](b []byte, opts ...Option) ([]T, error) {
 	return Unmarshal[T](bytes.NewReader(b), int64(len(b)), opts...)
+}
+
+// UnmarshalFile opens the parquet file at path, decodes every row into a []T,
+// and closes the file. The simplest entry point when you have a file on disk and
+// want the whole result set; for very large files, prefer the streaming Reader.
+func UnmarshalFile[T any](path string, opts ...Option) ([]T, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+
+	return Unmarshal[T](f, fi.Size(), opts...)
 }
 
 func decodeFile[T any](f *parquet.File, cfg config) ([]T, error) {
