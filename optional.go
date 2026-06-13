@@ -26,6 +26,7 @@ func addOptionalPrimitive(plan *Plan, offset uintptr, path []string, schema *par
 		return nil
 	}
 
+	plan.markRef(leaf.ColumnIndex)
 	plan.scalars = append(plan.scalars, scalarSetter{
 		offset: offset,
 		col:    int32(leaf.ColumnIndex),

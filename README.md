@@ -114,6 +114,36 @@ When `n > 1`, the `io.ReaderAt` passed to `Unmarshal` must support concurrent
 `ReadAt` calls. `*os.File` and `*bytes.Reader` do, so `UnmarshalFile` and
 `UnmarshalBytes` are always safe; only a custom `io.ReaderAt` needs checking.
 
+## Column projection (read only the columns you need)
+
+To read a subset of a wide file's columns, decode into a struct that contains
+only those fields. Columns your Go type doesn't map to are **skipped in the read
+pipeline** — no page fetch, no decompression, no decode — not merely ignored:
+
+```go
+// File has 50 columns; you only need two.
+type Slim struct {
+    ID   int64  `parquet:"id"`
+    Name string `parquet:"name"`
+}
+
+rows, err := parquetfast.UnmarshalFile[Slim]("wide.parquet") // reads 2 columns, not 50
+```
+
+This is on by default and needs no flag — just use a narrower struct. Reading 2
+scalar columns from a wide record reads ~10% of the bytes and is ~3.7× faster
+than decoding the full struct. The result is identical to decoding the full
+struct and discarding the extra fields.
+
+Notes:
+- A compound field that *is* present (a map, list, or struct-valued field) reads
+  its whole subtree; projection drops whole unreferenced columns/fields, not
+  individual leaves inside a kept container.
+- An optional-struct field that is present reads all of its descendant columns
+  (its presence is detected from them).
+- `WithoutColumnProjection()` turns it off and reads every column (same result,
+  more work) — useful only for debugging.
+
 ---
 
 ## How it works

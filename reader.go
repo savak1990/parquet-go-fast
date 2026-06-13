@@ -50,10 +50,17 @@ func NewReader[T any](r io.ReaderAt, size int64, opts ...Option) (*Reader[T], er
 		return nil, fmt.Errorf("build plan for %s: %w", reflect.TypeFor[T]().Name(), err)
 	}
 
+	mask := skip
+	if cfg.projection {
+		if m := plan.unreferencedMask(); m != nil {
+			mask = m
+		}
+	}
+
 	return &Reader[T]{
 		file:     f,
 		plan:     plan,
-		rows:     openRows(rgs, skip),
+		rows:     openRows(rgs, mask),
 		schema:   f.Schema(),
 		numRows:  f.NumRows(),
 		leafVals: make([][]parquet.Value, plan.NumLeaves()),

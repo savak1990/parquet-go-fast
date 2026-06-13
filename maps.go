@@ -55,6 +55,9 @@ func addPrimitiveMap(plan *Plan, mt reflect.Type, offset uintptr, path []string,
 		return unsupportedKindErr(mt, path)
 	}
 
+	plan.markRef(keyCol)
+	plan.markRef(valCol)
+
 	plan.compound = append(plan.compound, func(base unsafe.Pointer, leafVals [][]parquet.Value) {
 		keys := leafVals[keyCol]
 		if len(keys) == 0 {
@@ -224,6 +227,12 @@ func addStructValuedMap(plan *Plan, mt reflect.Type, offset uintptr, path []stri
 		offset:    offset,
 	}
 
+	// A present struct-valued map reads the key column and its whole value
+	// subtree (entry iteration + rep-splitting), so mark all of it referenced.
+	plan.markRef(ctx.keyCol)
+	plan.markRefs(ctx.info.scalarCols)
+	plan.markRefs(ctx.info.nestedCols)
+
 	if filler, ok := typedStructValuedMapFiller(mt); ok {
 		plan.compound = append(plan.compound, func(base unsafe.Pointer, leafVals [][]parquet.Value) {
 			keys := leafVals[ctx.keyCol]
@@ -341,6 +350,9 @@ func addNestedMap(plan *Plan, mt reflect.Type, offset uintptr, path []string, sc
 		return nil
 	}
 
+	plan.markRef(np.outerKeyCol)
+	plan.markRef(np.innerKeyCol)
+	plan.markRef(np.innerValCol)
 	plan.compound = append(plan.compound, np.run)
 
 	return nil

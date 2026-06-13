@@ -28,6 +28,7 @@ func addScalarLeaf(plan *Plan, offset uintptr, path []string, schema *parquet.Sc
 		return nil
 	}
 
+	plan.markRef(leaf.ColumnIndex)
 	plan.scalars = append(plan.scalars, scalarSetter{
 		offset: offset,
 		col:    int32(leaf.ColumnIndex),

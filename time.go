@@ -43,6 +43,7 @@ func addTimeLeaf(plan *Plan, offset uintptr, path []string, schema *parquet.Sche
 		return unsupportedTimeErr(path)
 	}
 
+	plan.markRef(leaf.ColumnIndex)
 	plan.scalars = append(plan.scalars, scalarSetter{
 		offset: offset,
 		col:    int32(leaf.ColumnIndex),
@@ -116,6 +117,7 @@ func addTimeList(plan *Plan, offset uintptr, path []string, schema *parquet.Sche
 	}
 
 	col := leaf.ColumnIndex
+	plan.markRef(col)
 
 	plan.compound = append(plan.compound, func(base unsafe.Pointer, leafVals [][]parquet.Value) {
 		vs := leafVals[col]
@@ -169,6 +171,9 @@ func addTimeValuedMap(plan *Plan, mt reflect.Type, offset uintptr, path []string
 	if !ok {
 		return unsupportedTimeErr(path)
 	}
+
+	plan.markRef(keyCol)
+	plan.markRef(valCol)
 
 	kt := mt.Key()
 

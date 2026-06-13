@@ -42,6 +42,11 @@ func addOptionalStruct(plan *Plan, st reflect.Type, offset uintptr, path []strin
 		return nil
 	}
 
+	// A present optional struct reads all its descendant columns: the sub-plan
+	// binds some, and the presence gate (anyDescendantPresent) inspects them all.
+	// Mark them referenced so projection never masks a presence-detection column.
+	plan.markRefs(descendantCols)
+
 	alloc, typed := typedOptionalStructAlloc(st)
 
 	plan.compound = append(plan.compound, func(base unsafe.Pointer, leafVals [][]parquet.Value) {

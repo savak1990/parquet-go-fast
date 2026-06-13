@@ -69,6 +69,7 @@ func addPrimitiveList(plan *Plan, ft reflect.Type, offset uintptr, path []string
 	}
 
 	col := leaf.ColumnIndex
+	plan.markRef(col)
 
 	plan.compound = append(plan.compound, func(base unsafe.Pointer, leafVals [][]parquet.Value) {
 		vs := leafVals[col]
@@ -228,6 +229,11 @@ func addStructList(plan *Plan, ft reflect.Type, offset uintptr, path []string, s
 
 	numLeaves := plan.numLeaves
 	info := collectSubtreeInfo(schema, elemPrefix, numLeaves, outerRep, plan.skipCol)
+
+	// A present struct list reads its whole element subtree (entry counting,
+	// rep-splitting, and the sentinel all need it), so mark all of it referenced.
+	plan.markRefs(info.scalarCols)
+	plan.markRefs(info.nestedCols)
 
 	sentinelCol, ok := pickSentinelCol(info)
 	if !ok {

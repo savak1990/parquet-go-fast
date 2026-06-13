@@ -46,11 +46,12 @@ import (
 type config struct {
 	batchSize   int
 	nullColSkip bool
+	projection  bool
 	concurrency int
 }
 
 func newConfig(opts []Option) config {
-	c := config{batchSize: 16, nullColSkip: true, concurrency: 1}
+	c := config{batchSize: 16, nullColSkip: true, projection: true, concurrency: 1}
 	for _, o := range opts {
 		o(&c)
 	}
@@ -85,6 +86,16 @@ func WithBatchSize(n int) Option {
 // read pipeline for columns proven 100% null in the file.
 func WithoutNullColumnSkip() Option {
 	return func(c *config) { c.nullColSkip = false }
+}
+
+// WithoutColumnProjection disables column projection. By default, only the
+// columns your Go type maps to are read from the file — any other column is
+// skipped in the read pipeline (no page fetch, decompression, or decode). Decode
+// into a struct with a subset of the file's fields to read just those columns.
+// This option turns that off and reads every column (the result is identical;
+// only the work differs).
+func WithoutColumnProjection() Option {
+	return func(c *config) { c.projection = false }
 }
 
 // WithConcurrency decodes one file across n worker goroutines, each handling a
@@ -147,6 +158,17 @@ func decodeFile[T any](f *parquet.File, cfg config) ([]T, error) {
 		return nil, fmt.Errorf("build plan for %s: %w", rt.Name(), err)
 	}
 
+	// Column projection: mask every leaf column the plan doesn't read so its
+	// pages are never fetched/decompressed/decoded. This subsumes the all-null
+	// skip (all-null columns are never referenced). The result is identical; only
+	// the work differs.
+	mask := skip
+	if cfg.projection {
+		if m := plan.unreferencedMask(); m != nil {
+			mask = m
+		}
+	}
+
 	total := int(f.NumRows())
 	out := make([]T, total)
 
@@ -156,14 +178,14 @@ func decodeFile[T any](f *parquet.File, cfg config) ([]T, error) {
 
 	workers := cfg.workers()
 	if workers > 1 && len(rgs) > 1 {
-		if err := decodeConcurrent(rgs, plan, skip, out, cfg.batchSize, min(workers, len(rgs))); err != nil {
+		if err := decodeConcurrent(rgs, plan, mask, out, cfg.batchSize, min(workers, len(rgs))); err != nil {
 			return nil, err
 		}
 
 		return out, nil
 	}
 
-	if err := decodeInto(rgs, plan, skip, out, cfg.batchSize); err != nil {
+	if err := decodeInto(rgs, plan, mask, out, cfg.batchSize); err != nil {
 		return nil, err
 	}
 

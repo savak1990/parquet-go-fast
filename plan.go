@@ -39,6 +39,13 @@ type Plan struct {
 	// Cached plans index on a hash of this bitmap (see planKey) so files with
 	// the same (rt, schema) but different null shapes don't alias.
 	skipCol []bool
+
+	// referenced marks every leaf column the plan reads — directly (a scalar
+	// setter) or structurally (a compound's key/subtree/presence columns).
+	// Columns the Go type does not map to stay false. Shared by reference with
+	// every sub-plan so nested bindings mark the same bitmap. Used for column
+	// projection: unreferenced columns can be masked out of the read pipeline.
+	referenced []bool
 }
 
 // compoundFn handles a Go field that reads from multiple leaf columns. Called
@@ -57,11 +64,48 @@ func (p *Plan) isSkipped(col int) bool {
 	return col < len(p.skipCol) && p.skipCol[col]
 }
 
-// newSubPlan returns an empty Plan sharing this plan's leaf count and skip
-// bitmap, for binding a nested struct subtree (optional struct, struct list,
-// struct-valued map).
+// newSubPlan returns an empty Plan sharing this plan's leaf count, skip bitmap,
+// and (by reference) referenced bitmap, for binding a nested struct subtree
+// (optional struct, struct list, struct-valued map). Sharing referenced means a
+// nested leaf binding marks the top-level plan's bitmap.
 func (p *Plan) newSubPlan() *Plan {
-	return &Plan{numLeaves: p.numLeaves, skipCol: p.skipCol}
+	return &Plan{numLeaves: p.numLeaves, skipCol: p.skipCol, referenced: p.referenced}
+}
+
+// markRef records that the plan reads leaf column col.
+func (p *Plan) markRef(col int) {
+	if col >= 0 && col < len(p.referenced) {
+		p.referenced[col] = true
+	}
+}
+
+// markRefs records a set of leaf columns as read.
+func (p *Plan) markRefs(cols []int) {
+	for _, c := range cols {
+		p.markRef(c)
+	}
+}
+
+// unreferencedMask returns a bitmap where true marks a leaf column the plan
+// never reads (safe to skip in the read pipeline). Returns nil if every column
+// is referenced (nothing to project away).
+func (p *Plan) unreferencedMask() []bool {
+	mask := make([]bool, p.numLeaves)
+
+	any := false
+
+	for c := 0; c < p.numLeaves; c++ {
+		if c >= len(p.referenced) || !p.referenced[c] {
+			mask[c] = true
+			any = true
+		}
+	}
+
+	if !any {
+		return nil
+	}
+
+	return mask
 }
 
 // hasBindings reports whether any Go field bound to this (sub-)plan.
@@ -192,6 +236,7 @@ func buildPlan(rt reflect.Type, schema *parquet.Schema, skip []bool) (*Plan, err
 		numLeaves: len(schema.Columns()),
 		skipCol:   skip,
 	}
+	plan.referenced = make([]bool, plan.numLeaves)
 
 	if err := addStructFields(plan, rt, 0, nil, schema); err != nil {
 		return nil, err
