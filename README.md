@@ -277,36 +277,49 @@ keys, `v.Int64()` for `int64`, `v.Int32()` for `int32`, `v.Double()` for
 
 ## Benchmarks
 
-200,000 rows of a realistically nested record (scalars, an optional struct, a
-`map[string]string`, and a `map[string]Struct`), snappy-compressed, 4 row
-groups. Apple M-series, Go 1.26, parquet-go v0.30.1. Synthetic data — no
-external fixtures.
+The gain is **workload-dependent**, so here is a matrix across data-model shapes
+rather than a single headline number. Each shape decodes 100,000 rows over 2 row
+groups (snappy), comparing `parquet-go`'s reflection `GenericReader` against
+`parquet-go-fast` — both **streaming with a reused 4096-row buffer** (the
+apples-to-apples comparison), with all typed registrations applied. Deltas are
+parquet-go-fast vs parquet-go (negative = better). Apple M4 Pro, Go 1.26,
+parquet-go v0.30.1. Synthetic data — reproduce with the command below.
 
-| Decoder | time/op | B/op | allocs/op |
+| Shape | time | bytes | allocs |
 |---|---:|---:|---:|
-| `parquet-go` `GenericReader` (streaming) | 198 ms | 155 MB | 5.85 M |
-| **`parquet-go-fast` `Reader`** (streaming) | **100 ms** | **80 MB** | **3.45 M** |
-| `parquet-go-fast` `UnmarshalBytes` (whole file in memory) | 139 ms | 260 MB¹ | 4.20 M |
+| Flat scalars (10 fields) | **−27%** | −3% | ~0% |
+| Scalars + optionals + `[]byte` | **−25%** | −2% | ~0% |
+| Primitive maps (`map[string]string`, …) | **−59%** | +64% | −50% |
+| Struct-valued map (12 entries/row) | **−42%** | +58% | −20% |
+| Deep nested structs (3 levels, optional) | **−22%** | −1% | ~0% |
+| Struct slices (`[]Struct`, 8/row) | **−24%** | +14% | −9% |
+| `time.Time` heavy (4 time cols + list) | **−54%** | −66% | −80% |
+| Wide mixed (all features at once) | **−37%** | +15% | −19% |
 
-Streaming vs streaming (the apples-to-apples comparison): **−50% time, −48%
-bytes, −41% allocations**.
+What this says:
 
-¹ `UnmarshalBytes` materializes all 200k decoded rows (and their nested maps)
-at once, so its byte count reflects the full result set, not steady-state
-working memory. Use `Reader` when you don't need every row resident.
+- **Latency is always lower — between −22% and −59%**, never slower. It is *not*
+  a constant ~47%; expect roughly −25% on flat/nested records and −40% to −60%
+  on map- and time-heavy ones (where avoiding reflection helps most).
+- **Allocation count is equal-to-much-lower** — about the same on flat/nested
+  shapes (both decoders pay the same string/`[]byte` content copies), and
+  sharply lower on map-heavy (−20% to −50%) and `time.Time`-heavy (−80%) shapes.
+- **Memory bytes are mixed.** Lower on scalar and `time.Time` shapes (the time
+  fast path is a big win: −66% bytes / −80% allocs), but **higher on map-heavy
+  shapes** (up to +64%): parquet-go-fast builds a fresh typed map per row, which
+  can allocate more total bytes than `GenericReader`'s reflection path even
+  though it makes fewer allocation *calls*. If steady-state memory on
+  map-dense data is your priority, measure before adopting.
 
-The gap is workload-dependent. On a deliberately extreme record (a wide
-e-commerce rollup with a high-cardinality `map[string]Struct`, a nested map, a
-struct slice, and several `[]byte` blobs — `BenchmarkMerchantDecode`), streaming
-is **−37% time, −19% allocations**, though total bytes run slightly higher than
-`GenericReader` because each row allocates many small maps/structs either way.
-Time and allocation count win across the board; raw bytes are close on the most
-map-dense shapes.
+The `time.Time` row is the standout: parquet-go decodes each timestamp through
+reflection (≈817k allocs here), while parquet-go-fast reconstructs it with a
+single typed `time.Unix` (≈167k).
 
 Reproduce:
 
 ```sh
-go test -run='^$' -bench='BenchmarkDecode|BenchmarkMerchantDecode|BenchmarkPlanApply' -benchmem
+go test -run='^$' -bench='BenchmarkShape' -benchmem -benchtime=10x
+go test -run='^$' -bench='BenchmarkConcurrentDecode|BenchmarkPlanApply' -benchmem
 ```
 
 ---
