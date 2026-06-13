@@ -126,8 +126,15 @@ Two stages: **Plan** (once) then **Apply** (per row).
 every leaf field, records a compact descriptor: the **parquet leaf-column index**
 it binds to, the field's **byte offset** within the struct, and a **kind enum**
 selecting the typed write. Fields spanning multiple columns (maps, lists,
-optional structs) get a closure. The result is cached on `(Go type, schema hash,
-null-column hash)`, so the reflection cost is paid once per shape.
+optional structs) get a closure.
+
+**The compiled plan is cached and reused.** The cache is process-wide,
+concurrency-safe, and keyed on `(Go type, schema hash, null-column hash)`, so the
+reflection walk runs **once per distinct shape for the whole process** — not once
+per call. Decoding 10,000 files with the same `T` and schema compiles one plan
+and reuses it for all of them; `Unmarshal`, `UnmarshalFile`, `UnmarshalBytes`,
+and `Reader` all share it. You don't manage this — `Compile` looks up the cache
+first and only builds on a miss.
 
 ### Stage 2 — Apply (per row, no reflection)
 
