@@ -345,11 +345,33 @@ The `time.Time` row is the standout: parquet-go decodes each timestamp through
 reflection (≈817k allocs here), while parquet-go-fast reconstructs it with a
 single typed `time.Unix` (≈167k).
 
+### Materialize-all on large data (the common case)
+
+The matrix above is *streaming* (reused buffer). Most callers instead use
+`UnmarshalBytes` / `UnmarshalFile`, which return the whole `[]T`. Compared to
+`GenericReader` reading the whole file into a slice — 500k rows of the wide mixed
+record over 10 row groups, Apple M4 Pro:
+
+| API | time | bytes | allocs |
+|---|---:|---:|---:|
+| `parquet-go` `GenericReader` (materialize) | 2623 ms | 5158 MB | 50.4 M |
+| **`UnmarshalBytes`** | **1304 ms** | **2401 MB** | **35.7 M** |
+| **`UnmarshalBytes` + `WithConcurrency(0)`** | **346 ms** | 2430 MB | 35.8 M |
+| `UnmarshalFile` | 1379 ms | 2400 MB | 35.7 M |
+| `UnmarshalFile` + `WithConcurrency(0)` | 349 ms | 2429 MB | 35.8 M |
+
+When both sides materialize the full result, parquet-go-fast wins on **all three
+axes** (−50% time, −53% bytes, −29% allocs) — the streaming "+bytes on map-heavy
+shapes" caveat does not apply here, because `GenericReader`'s materialize path is
+much heavier per row. Concurrency adds a further 3.8× (−87% / 7.6× vs
+`GenericReader`) on this 10-row-group file.
+
 Reproduce:
 
 ```sh
 go test -run='^$' -bench='BenchmarkShape' -benchmem -benchtime=10x
-go test -run='^$' -bench='BenchmarkConcurrentDecode|BenchmarkPlanApply' -benchmem
+go test -run='^$' -bench='BenchmarkLargeUnmarshal' -benchmem -benchtime=5x
+go test -run='^$' -bench='BenchmarkConcurrentDecode|BenchmarkProjection|BenchmarkPlanApply' -benchmem
 ```
 
 ---
