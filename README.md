@@ -187,6 +187,48 @@ pruned groups' pages are never read. NULL values never match a value predicate.
 Filtering currently runs sequentially (`WithConcurrency` is ignored when `Where`
 is set).
 
+## Reading from S3 / remote storage
+
+parquet-go reads the **footer first** and then only the byte ranges of the pages
+it actually needs (via `io.ReaderAt.ReadAt`). So if you back the reader with
+ranged GETs, a decode downloads only the bytes it uses — and combined with
+**column projection** (decode a narrow struct) and **`Where(...)` filtering**
+(prune row groups), reading a few columns or a selective slice of a large remote
+file fetches a small fraction of it. The library stays dependency-free; you
+supply the transport via `ReaderAtFunc`:
+
+```go
+ra := parquetfast.ReaderAtFunc(func(p []byte, off int64) (int, error) {
+    out, err := s3c.GetObject(ctx, &s3.GetObjectInput{
+        Bucket: aws.String(bucket),
+        Key:    aws.String(key),
+        Range:  aws.String(fmt.Sprintf("bytes=%d-%d", off, off+int64(len(p))-1)),
+    })
+    if err != nil { return 0, err }
+    defer out.Body.Close()
+    return io.ReadFull(out.Body, p)
+})
+
+rows, err := parquetfast.Unmarshal[Event](ra, objectSize,
+    parquetfast.Where(parquetfast.Col("ts").Between(start, end)), // prune row groups
+    parquetfast.WithOptimisticRead(),                            // footer in one GET
+    parquetfast.WithReadBufferSize(4<<20),                       // fewer, larger GETs
+)
+```
+
+Tuning options (each forwards a parquet-go read option):
+- `WithOptimisticRead()` — read the footer region in a single request at open.
+- `WithReadBufferSize(n)` — larger buffer ⇒ fewer, larger range GETs (try `4<<20`).
+- `WithAsyncReads()` — prefetch pages in the background to hide GET latency.
+- `WithFileOptions(...)` — pass any other `parquet.FileOption` (e.g. bloom prefetch).
+
+Measured against an in-memory reader that counts ranged reads (a stand-in for
+S3): a 2-column projection fetched **21%** of the bytes of a full decode, a
+selective `Where` fetched **19%**, and `WithOptimisticRead` cut open-time round
+trips from 10 to 7. If `WithConcurrency(n>1)` is used, `ReadAt` must be safe for
+concurrent calls (S3 `GetObject` is). Filtering applies to `Unmarshal`/
+`UnmarshalBytes`/`UnmarshalFile`, not the streaming `Reader`.
+
 ---
 
 ## How it works

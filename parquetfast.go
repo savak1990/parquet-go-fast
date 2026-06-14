@@ -49,6 +49,7 @@ type config struct {
 	projection  bool
 	concurrency int
 	predicates  []Predicate
+	fileOptions []parquet.FileOption
 }
 
 func newConfig(opts []Option) config {
@@ -114,12 +115,14 @@ func WithConcurrency(n int) Option {
 // Unmarshal decodes every row of the parquet file in r into a []T. r must be an
 // io.ReaderAt of exactly size bytes (e.g. *bytes.Reader, *os.File).
 func Unmarshal[T any](r io.ReaderAt, size int64, opts ...Option) ([]T, error) {
-	f, err := parquet.OpenFile(r, size)
+	cfg := newConfig(opts)
+
+	f, err := parquet.OpenFile(r, size, cfg.fileOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("open parquet file: %w", err)
 	}
 
-	return decodeFile[T](f, newConfig(opts))
+	return decodeFile[T](f, cfg)
 }
 
 // UnmarshalBytes is Unmarshal over an in-memory parquet file.

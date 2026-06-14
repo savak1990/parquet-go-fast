@@ -33,7 +33,7 @@ type Reader[T any] struct {
 func NewReader[T any](r io.ReaderAt, size int64, opts ...Option) (*Reader[T], error) {
 	cfg := newConfig(opts)
 
-	f, err := parquet.OpenFile(r, size)
+	f, err := parquet.OpenFile(r, size, cfg.fileOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("open parquet file: %w", err)
 	}
