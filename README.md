@@ -159,12 +159,28 @@ rows, err := parquetfast.UnmarshalFile[Event]("events.parquet",
 )
 ```
 
-Build leaf predicates with `Col(path...)` and one of `Equal`, `Less`,
+Build leaf predicates with `Col(path...)` and one of `Equal`, `NotEqual`, `Less`,
 `LessOrEqual`, `Greater`, `GreaterOrEqual`, `Between`, and combine them with
-`And` / `Or` (nestable). Multiple predicates in one `Where` are ANDed. Supported
-value types: bool, all int/uint widths, float32/64, string, `[]byte`, and
-`time.Time` (against TIMESTAMP/DATE columns). The filter column **need not be a
-field of your struct** — you can filter on a column you don't decode.
+`And` / `Or` / `Not` (nestable). Multiple predicates in one `Where` are ANDed.
+Supported value types: bool, all int/uint widths, float32/64, string, `[]byte`,
+and `time.Time` (against TIMESTAMP/DATE columns). The filter column **need not be
+a field of your struct** — you can filter on a column you don't decode.
+
+```go
+// status != "ok" AND NOT(region == "eu" AND tier < 2)
+parquetfast.Where(
+    parquetfast.Col("status").NotEqual("ok"),
+    parquetfast.Not(parquetfast.And(
+        parquetfast.Col("region").Equal("eu"),
+        parquetfast.Col("tier").Less(int64(2)),
+    )),
+)
+```
+
+`Not(...)` is normalized at compile time by pushing the negation down to the
+leaves (De Morgan: `!(a AND b)` → `!a OR !b`, `!(x == v)` → `x != v`,
+`!Between` → `< lo OR > hi`), so pruning still applies. As in SQL, NULL never
+matches a value predicate (so `NotEqual`/`Not` exclude NULL rows).
 
 ```go
 // region == "eu" AND (status == "error" OR latency_ms > 1000)

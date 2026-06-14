@@ -430,3 +430,89 @@ func TestFilter_OrPrunesRowGroups(t *testing.T) {
 		}
 	}
 }
+
+func TestFilter_NotEqualAndNot(t *testing.T) {
+	data := filterFixture(t, 300, 50)
+
+	// NotEqual leaf.
+	assertFilter(t, data, func(r filterRow) bool { return r.Region != "eu" },
+		parquetfast.Col("region").NotEqual("eu"))
+
+	// Not of a leaf == NotEqual.
+	assertFilter(t, data, func(r filterRow) bool { return r.Region != "us" },
+		parquetfast.Not(parquetfast.Col("region").Equal("us")))
+
+	// Not of a range → outside the range (x < lo OR x > hi).
+	assertFilter(t, data, func(r filterRow) bool { return r.ID < 100 || r.ID > 200 },
+		parquetfast.Not(parquetfast.Col("id").Between(int64(100), int64(200))))
+
+	// De Morgan: !(region==eu AND id<150) = region!=eu OR id>=150.
+	assertFilter(t, data,
+		func(r filterRow) bool { return r.Region != "eu" || r.ID >= 150 },
+		parquetfast.Not(parquetfast.And(
+			parquetfast.Col("region").Equal("eu"),
+			parquetfast.Col("id").Less(int64(150)),
+		)))
+
+	// Double negation.
+	assertFilter(t, data, func(r filterRow) bool { return r.ID == 42 },
+		parquetfast.Not(parquetfast.Not(parquetfast.Col("id").Equal(int64(42)))))
+}
+
+func TestFilter_NotEqualPrunesConstantGroup(t *testing.T) {
+	// One column is constant within each row group, so != that constant prunes
+	// the matching group entirely (min == max == value).
+	type cgRow struct {
+		Grp int64 `parquet:"grp"`
+		Seq int64 `parquet:"seq"`
+	}
+
+	rows := make([]cgRow, 2000)
+	for i := range rows {
+		rows[i] = cgRow{Grp: int64(i / 100), Seq: int64(i)} // grp constant per 100-row group
+	}
+
+	var buf bytes.Buffer
+	w := parquet.NewGenericWriter[cgRow](&buf, parquet.MaxRowsPerRowGroup(100))
+	if _, err := w.Write(rows); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	data := buf.Bytes()
+
+	f, _ := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
+	if _, _, ok := f.RowGroups()[0].ColumnChunks()[0].(*parquet.FileColumnChunk).Bounds(); !ok {
+		t.Skip("no stats")
+	}
+
+	read := func(opts ...parquetfast.Option) int64 {
+		cr := &countingReaderAt{r: bytes.NewReader(data)}
+		if _, err := parquetfast.Unmarshal[cgRow](cr, int64(len(data)), opts...); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return cr.bytes.Load()
+	}
+
+	full := read()
+	// grp != 5 prunes exactly the one group where grp==5 (min==max==5).
+	filtered := read(parquetfast.Where(parquetfast.Col("grp").NotEqual(int64(5))))
+
+	t.Logf("!= constant-group bytes: full=%d, filtered=%d", full, filtered)
+
+	if filtered >= full {
+		t.Fatalf("!= should prune the constant group: %d >= %d", filtered, full)
+	}
+
+	got, _ := parquetfast.UnmarshalBytes[cgRow](data, parquetfast.Where(parquetfast.Col("grp").NotEqual(int64(5))))
+	if len(got) != 1900 {
+		t.Fatalf("expected 1900 rows (all but group 5), got %d", len(got))
+	}
+	for _, r := range got {
+		if r.Grp == 5 {
+			t.Fatalf("group 5 row leaked: %+v", r)
+		}
+	}
+}

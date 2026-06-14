@@ -27,6 +27,7 @@ type predOp uint8
 
 const (
 	opEq predOp = iota
+	opNe
 	opLt
 	opLe
 	opGt
@@ -40,6 +41,7 @@ const (
 	predLeaf predKind = iota
 	predAnd
 	predOr
+	predNot
 )
 
 // Predicate is a row filter: a leaf column comparison (built with Col(...)) or a
@@ -71,6 +73,9 @@ func (c ColRef) leaf(op predOp, lo, hi any) Predicate {
 // Equal matches rows where the column equals v.
 func (c ColRef) Equal(v any) Predicate { return c.leaf(opEq, v, nil) }
 
+// NotEqual matches rows where the column does not equal v. (NULL never matches.)
+func (c ColRef) NotEqual(v any) Predicate { return c.leaf(opNe, v, nil) }
+
 // Less matches rows where the column is < v.
 func (c ColRef) Less(v any) Predicate { return c.leaf(opLt, v, nil) }
 
@@ -91,6 +96,12 @@ func And(preds ...Predicate) Predicate { return Predicate{kind: predAnd, childre
 
 // Or matches rows satisfying any of preds. Nestable with And.
 func Or(preds ...Predicate) Predicate { return Predicate{kind: predOr, children: preds} }
+
+// Not matches rows that do NOT satisfy p. It is normalized at compile time by
+// pushing the negation down to the leaves (De Morgan), so pruning still applies.
+// Note NULL values never match a value predicate, so Not(Col(x).Equal(v)) is
+// x != v over non-null rows (NULLs are excluded), matching SQL semantics.
+func Not(p Predicate) Predicate { return Predicate{kind: predNot, children: []Predicate{p}} }
 
 // Where keeps only rows matching the given predicates (multiple are ANDed; use
 // And/Or to nest). Row groups and pages that cannot match are skipped without
@@ -115,13 +126,80 @@ type compiledPredicate struct {
 	children []compiledPredicate
 }
 
-// compileRoot compiles the top-level predicate list (ANDed) into one tree.
+// compileRoot compiles the top-level predicate list (ANDed) into one tree,
+// after normalizing away Not nodes.
 func compileRoot(schema *parquet.Schema, preds []Predicate) (compiledPredicate, error) {
+	root := Predicate{kind: predAnd, children: preds}
 	if len(preds) == 1 {
-		return compilePredicate(schema, preds[0])
+		root = preds[0]
 	}
 
-	return compilePredicate(schema, Predicate{kind: predAnd, children: preds})
+	return compilePredicate(schema, normalize(root))
+}
+
+// normalize returns an equivalent predicate tree with no Not nodes (negation
+// pushed down to the leaves via De Morgan).
+func normalize(p Predicate) Predicate {
+	switch p.kind {
+	case predNot:
+		return negate(p.children[0])
+	case predAnd, predOr:
+		children := make([]Predicate, len(p.children))
+		for i := range p.children {
+			children[i] = normalize(p.children[i])
+		}
+
+		return Predicate{kind: p.kind, children: children}
+	default:
+		return p
+	}
+}
+
+// negate returns the De Morgan negation of p as a normalized (Not-free) tree.
+func negate(p Predicate) Predicate {
+	switch p.kind {
+	case predNot:
+		return normalize(p.children[0]) // !!x = x
+	case predAnd: // !(a AND b ...) = !a OR !b ...
+		return Predicate{kind: predOr, children: negateEach(p.children)}
+	case predOr: // !(a OR b ...) = !a AND !b ...
+		return Predicate{kind: predAnd, children: negateEach(p.children)}
+	default:
+		return negateLeaf(p)
+	}
+}
+
+func negateEach(in []Predicate) []Predicate {
+	out := make([]Predicate, len(in))
+	for i := range in {
+		out[i] = negate(in[i])
+	}
+
+	return out
+}
+
+// negateLeaf flips a leaf comparison to its complement.
+func negateLeaf(p Predicate) Predicate {
+	c := ColRef{path: p.path}
+
+	switch p.op {
+	case opEq:
+		return c.NotEqual(p.lo)
+	case opNe:
+		return c.Equal(p.lo)
+	case opLt:
+		return c.GreaterOrEqual(p.lo)
+	case opLe:
+		return c.Greater(p.lo)
+	case opGt:
+		return c.LessOrEqual(p.lo)
+	case opGe:
+		return c.Less(p.lo)
+	case opBetween: // !(lo <= x <= hi) = x < lo OR x > hi
+		return Or(c.Less(p.lo), c.Greater(p.hi))
+	}
+
+	return p
 }
 
 func compilePredicate(schema *parquet.Schema, p Predicate) (compiledPredicate, error) {
@@ -313,6 +391,9 @@ func (cp *compiledPredicate) leafKeepRowGroup(rg parquet.RowGroup) bool {
 		}
 
 		return cp.bloomKeep(chunk)
+	case opNe:
+		// Prune only if every value equals lo (min == max == lo).
+		return cp.typ.Compare(minV, cp.lo) != 0 || cp.typ.Compare(maxV, cp.lo) != 0
 	case opLt:
 		return cp.typ.Compare(minV, cp.lo) < 0
 	case opLe:
@@ -356,6 +437,8 @@ func (cp *compiledPredicate) pageCanMatch(ci parquet.ColumnIndex, p int) bool {
 	switch cp.op {
 	case opEq:
 		return cp.typ.Compare(cp.lo, minV) >= 0 && cp.typ.Compare(cp.lo, maxV) <= 0
+	case opNe:
+		return cp.typ.Compare(minV, cp.lo) != 0 || cp.typ.Compare(maxV, cp.lo) != 0
 	case opLt:
 		return cp.typ.Compare(minV, cp.lo) < 0
 	case opLe:
@@ -492,6 +575,8 @@ func (cp *compiledPredicate) matchRow(v parquet.Value) bool {
 	switch cp.op {
 	case opEq:
 		return cp.typ.Compare(v, cp.lo) == 0
+	case opNe:
+		return cp.typ.Compare(v, cp.lo) != 0
 	case opLt:
 		return cp.typ.Compare(v, cp.lo) < 0
 	case opLe:
