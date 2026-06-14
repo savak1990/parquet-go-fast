@@ -144,6 +144,49 @@ Notes:
 - `WithoutColumnProjection()` turns it off and reads every column (same result,
   more work) — useful only for debugging.
 
+## Filtering rows (predicate pushdown)
+
+Pass `Where(...)` to keep only matching rows. Row groups whose column statistics
+(min/max, null count) or bloom filter prove they can't match are **skipped
+entirely** — their pages are never fetched, decompressed, or decoded:
+
+```go
+rows, err := parquetfast.UnmarshalFile[Event]("events.parquet",
+    parquetfast.Where(
+        parquetfast.Col("ts").Between(start, end),   // time range
+        parquetfast.Col("region").Equal("eu"),       // AND
+    ),
+)
+```
+
+Build predicates with `Col(path...)` and one of `Equal`, `Less`, `LessOrEqual`,
+`Greater`, `GreaterOrEqual`, `Between`. Multiple predicates in one `Where` are
+ANDed. Supported value types: bool, all int/uint widths, float32/64, string,
+`[]byte`, and `time.Time` (against TIMESTAMP/DATE columns). The filter column
+**need not be a field of your struct** — you can filter on a column you don't
+decode.
+
+How it works:
+- **Row-group pruning** — before reading any pages, each group's min/max and null
+  count are compared to the predicate (`Equal` also consults the bloom filter, if
+  present), skipping groups that can't match.
+- **Row filtering** — surviving groups are decoded and only matching rows are
+  returned, in file order.
+
+Effectiveness scales with how well the data is clustered on the filter column.
+On a 1M-row file (20 row groups) where the predicate selects ~one group:
+
+| | time | bytes | allocs |
+|---|---:|---:|---:|
+| full decode | 55.8 ms | 39.5 MB | 1.00 M |
+| `Where(Col("id").Between(…))` | **3.1 ms** | **2.1 MB** | **41 k** |
+
+That's **~18× faster, −95% bytes, −96% allocs** — and against a range-capable
+`io.ReaderAt` (e.g. S3) it also fetches ~95% fewer bytes off the wire, since
+pruned groups' pages are never read. NULL values never match a value predicate.
+Filtering currently runs sequentially (`WithConcurrency` is ignored when `Where`
+is set).
+
 ---
 
 ## How it works
@@ -399,7 +442,7 @@ Reproduce:
 ```sh
 go test -run='^$' -bench='BenchmarkShape' -benchmem -benchtime=10x
 go test -run='^$' -bench='BenchmarkLargeUnmarshal|BenchmarkSparseWide' -benchmem -benchtime=5x
-go test -run='^$' -bench='BenchmarkConcurrentDecode|BenchmarkProjection|BenchmarkPlanApply' -benchmem
+go test -run='^$' -bench='BenchmarkConcurrentDecode|BenchmarkProjection|BenchmarkFilter|BenchmarkPlanApply' -benchmem
 ```
 
 ---
