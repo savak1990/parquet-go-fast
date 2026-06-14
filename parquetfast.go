@@ -318,10 +318,60 @@ func decodeConcurrent[T any](rgs []parquet.RowGroup, plan *Plan, skip []bool, ou
 	return firstErr
 }
 
-// decodeFiltered prunes row groups that can't match the predicates, then decodes
-// the surviving groups and keeps only matching rows. Sequential (concurrency is
-// not applied to the filtered path). Returns the matching rows in file order.
+// decodeFiltered prunes row groups + pages that can't match the predicates, then
+// decodes the surviving rows and keeps only matching ones (file order). Backs the
+// filtered path of Unmarshal / UnmarshalBytes / UnmarshalFile.
 func decodeFiltered[T any](f *parquet.File, cfg config, plan *Plan, mask []bool) (result []T, err error) {
+	fr, err := newFilteredReader(f, cfg, plan, mask)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		if cerr := fr.close(); cerr != nil && err == nil {
+			err = fmt.Errorf("close parquet rows: %w", cerr)
+		}
+	}()
+
+	// Upper bound: total rows of the surviving (row-group-pruned) groups.
+	upper := 0
+	for _, g := range fr.groups {
+		upper += int(g.NumRows())
+	}
+
+	out := make([]T, upper)
+	if upper == 0 {
+		return out[:0], nil
+	}
+
+	n, rerr := filteredRead(fr, out)
+	if rerr != nil && !errors.Is(rerr, io.EOF) {
+		return nil, rerr
+	}
+
+	return out[:n], nil
+}
+
+// filteredReader drives predicate-filtered decoding with row-group + page pruning
+// and page-aligned seeks. Shared by the materialize-all filtered path and the
+// streaming Reader. Not safe for concurrent use.
+type filteredReader struct {
+	groups   []parquet.RowGroup // row-group-pruned, masked
+	preds    []compiledPred
+	plan     *Plan
+	leafVals [][]parquet.Value
+	batch    []parquet.Row
+
+	gi     int          // current group index
+	rows   parquet.Rows // current group's reader (nil between groups)
+	ranges [][2]int64   // current group's page-pruned row ranges (group-local)
+	ri     int          // current range index
+	pos    int64        // next group-local row to read
+}
+
+// newFilteredReader compiles predicates, prunes row groups by statistics/bloom,
+// and masks each surviving group (forcing predicate columns to be read).
+func newFilteredReader(f *parquet.File, cfg config, plan *Plan, mask []bool) (*filteredReader, error) {
 	preds, err := compilePredicates(f.Schema(), cfg.predicates)
 	if err != nil {
 		return nil, err
@@ -339,37 +389,131 @@ func decodeFiltered[T any](f *parquet.File, cfg config, plan *Plan, mask []bool)
 		mask = m
 	}
 
-	// Prune: keep only row groups that might contain a matching row.
 	rgs := f.RowGroups()
-	surviving := make([]parquet.RowGroup, 0, len(rgs))
-	upperBound := 0
+	groups := make([]parquet.RowGroup, 0, len(rgs))
 
 	for _, rg := range rgs {
 		if keepRowGroup(preds, rg) {
-			surviving = append(surviving, rg)
-			upperBound += int(rg.NumRows())
+			groups = append(groups, NewMaskedRowGroup(rg, mask))
 		}
 	}
 
-	out := make([]T, upperBound) // upper bound; trimmed to matches below
-	if upperBound == 0 {
-		return out[:0], nil
+	batchSize := cfg.batchSize
+	if batchSize < 1 {
+		batchSize = 16
 	}
 
-	rows := openRows(surviving, mask)
+	return &filteredReader{
+		groups:   groups,
+		preds:    preds,
+		plan:     plan,
+		leafVals: make([][]parquet.Value, plan.NumLeaves()),
+		batch:    make([]parquet.Row, batchSize),
+	}, nil
+}
 
-	defer func() {
-		if cerr := rows.Close(); cerr != nil && err == nil {
-			err = fmt.Errorf("close parquet rows: %w", cerr)
+func (fr *filteredReader) close() error {
+	if fr.rows == nil {
+		return nil
+	}
+
+	err := fr.rows.Close()
+	fr.rows = nil
+
+	return err
+}
+
+// filteredRead fills dst with up to len(dst) matching rows, advancing across
+// groups and page-pruned ranges (seeking over pruned pages). Returns io.EOF once
+// all surviving groups are exhausted (possibly with the final rows).
+func filteredRead[T any](fr *filteredReader, dst []T) (int, error) {
+	var zero T
+
+	w := 0
+
+	for w < len(dst) {
+		if fr.rows == nil {
+			if fr.gi >= len(fr.groups) {
+				return w, io.EOF
+			}
+
+			rg := fr.groups[fr.gi]
+			fr.rows = rg.Rows()
+			fr.ranges = candidateRanges(rg, fr.preds)
+			fr.ri = 0
+			fr.pos = 0
 		}
-	}()
 
-	n, err := decodeMatching(rows, plan, preds, out, cfg.batchSize)
-	if err != nil {
-		return nil, err
+		if fr.ri >= len(fr.ranges) {
+			cerr := fr.rows.Close()
+			fr.rows = nil
+			fr.gi++
+
+			if cerr != nil {
+				return w, fmt.Errorf("close parquet rows: %w", cerr)
+			}
+
+			continue
+		}
+
+		rng := fr.ranges[fr.ri]
+
+		// Seek over pruned pages to the start of this range (forward only).
+		if fr.pos < rng[0] {
+			if err := fr.rows.SeekToRow(rng[0]); err != nil {
+				return w, fmt.Errorf("seek to row %d: %w", rng[0], err)
+			}
+
+			fr.pos = rng[0]
+		}
+
+		remain := rng[1] - fr.pos
+		if remain <= 0 {
+			fr.ri++
+
+			continue
+		}
+
+		// Bound the read so we never decode past the range or overfill dst —
+		// every row read is processed, so no rows are dropped on a full dst.
+		want := len(fr.batch)
+		if int64(want) > remain {
+			want = int(remain)
+		}
+
+		if want > len(dst)-w {
+			want = len(dst) - w
+		}
+
+		n, rerr := fr.rows.ReadRows(fr.batch[:want])
+		for i := 0; i < n; i++ {
+			fr.pos++
+
+			unflattenRow(fr.batch[i], fr.leafVals)
+
+			if matchAll(fr.preds, fr.leafVals) {
+				dst[w] = zero // reset (dst may be a reused streaming buffer)
+				fr.plan.applyDecoded(unsafe.Pointer(&dst[w]), fr.leafVals)
+				w++
+			}
+		}
+
+		if fr.pos >= rng[1] {
+			fr.ri++
+		}
+
+		if rerr != nil {
+			if !errors.Is(rerr, io.EOF) {
+				return w, fmt.Errorf("read parquet rows: %w", rerr)
+			}
+
+			if n == 0 {
+				fr.ri = len(fr.ranges) // group exhausted; advance to the next
+			}
+		}
 	}
 
-	return out[:n], nil
+	return w, nil
 }
 
 // keepRowGroup reports whether rg survives all predicates (AND).
@@ -381,43 +525,6 @@ func keepRowGroup(preds []compiledPred, rg parquet.RowGroup) bool {
 	}
 
 	return true
-}
-
-// decodeMatching decodes rows, applying the plan only to rows that match all
-// predicates, writing them compactly into out. Returns the number written.
-func decodeMatching[T any](rows parquet.Rows, plan *Plan, preds []compiledPred, out []T, batchSize int) (int, error) {
-	rowBatch := make([]parquet.Row, batchSize)
-	leafVals := make([][]parquet.Value, plan.NumLeaves())
-
-	w := 0
-
-	for {
-		n, rerr := rows.ReadRows(rowBatch)
-		for i := 0; i < n; i++ {
-			unflattenRow(rowBatch[i], leafVals)
-
-			if !matchAll(preds, leafVals) {
-				continue
-			}
-
-			if w >= len(out) {
-				return w, fmt.Errorf("filtered rows exceed pre-allocated buffer of %d (possibly corrupted file)", len(out))
-			}
-
-			plan.applyDecoded(unsafe.Pointer(&out[w]), leafVals)
-			w++
-		}
-
-		if rerr != nil {
-			if !errors.Is(rerr, io.EOF) {
-				return w, fmt.Errorf("read parquet rows: %w", rerr)
-			}
-
-			if n == 0 {
-				return w, nil
-			}
-		}
-	}
 }
 
 // matchAll reports whether the row's values satisfy every predicate. A predicate

@@ -26,6 +26,10 @@ type Reader[T any] struct {
 	leafVals [][]parquet.Value
 	batch    []parquet.Row
 	done     bool
+
+	// filtered is non-nil when Where(...) was passed: Read then streams only
+	// matching rows, with row-group + page pruning. rows is unused in that mode.
+	filtered *filteredReader
 }
 
 // NewReader opens the parquet file in r (an io.ReaderAt of size bytes) and
@@ -57,14 +61,29 @@ func NewReader[T any](r io.ReaderAt, size int64, opts ...Option) (*Reader[T], er
 		}
 	}
 
-	return &Reader[T]{
+	rd := &Reader[T]{
 		file:     f,
 		plan:     plan,
-		rows:     openRows(rgs, mask),
 		schema:   f.Schema(),
 		numRows:  f.NumRows(),
 		leafVals: make([][]parquet.Value, plan.NumLeaves()),
-	}, nil
+	}
+
+	// Where(...) → stream only matching rows, with row-group + page pruning.
+	if len(cfg.predicates) > 0 {
+		fr, err := newFilteredReader(f, cfg, plan, mask)
+		if err != nil {
+			return nil, err
+		}
+
+		rd.filtered = fr
+
+		return rd, nil
+	}
+
+	rd.rows = openRows(rgs, mask)
+
+	return rd, nil
 }
 
 // NumRows returns the total row count reported by the file footer.
@@ -101,6 +120,19 @@ func (rd *Reader[T]) Read(dst []T) (int, error) {
 
 	if len(dst) == 0 {
 		return 0, nil
+	}
+
+	if rd.filtered != nil {
+		n, err := filteredRead(rd.filtered, dst)
+		if errors.Is(err, io.EOF) {
+			rd.done = true
+
+			if n > 0 {
+				return n, nil // surface the final rows now, EOF on the next call
+			}
+		}
+
+		return n, err
 	}
 
 	if cap(rd.batch) < len(dst) {
@@ -141,6 +173,14 @@ func (rd *Reader[T]) Read(dst []T) (int, error) {
 
 // Close releases the underlying row reader.
 func (rd *Reader[T]) Close() error {
+	if rd.filtered != nil {
+		if err := rd.filtered.close(); err != nil {
+			return fmt.Errorf("close parquet rows: %w", err)
+		}
+
+		return nil
+	}
+
 	if err := rd.rows.Close(); err != nil {
 		return fmt.Errorf("close parquet rows: %w", err)
 	}

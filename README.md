@@ -166,12 +166,20 @@ ANDed. Supported value types: bool, all int/uint widths, float32/64, string,
 **need not be a field of your struct** — you can filter on a column you don't
 decode.
 
-How it works:
+How it works (coarse to fine):
 - **Row-group pruning** — before reading any pages, each group's min/max and null
   count are compared to the predicate (`Equal` also consults the bloom filter, if
   present), skipping groups that can't match.
-- **Row filtering** — surviving groups are decoded and only matching rows are
+- **Page pruning + seek** — within a surviving group, the column's page index
+  (per-page min/max + first-row offsets) identifies which pages can match; the
+  reader seeks straight to those pages (`SeekToRow`) and skips the rest, so
+  pruned pages are never fetched or decoded. Multi-column predicates intersect
+  their surviving page ranges.
+- **Row filtering** — the surviving rows are decoded and only matching ones are
   returned, in file order.
+
+This works through every read API — `Unmarshal`, `UnmarshalBytes`,
+`UnmarshalFile`, and the streaming `Reader` (`NewReader[T](r, size, Where(...))`).
 
 Effectiveness scales with how well the data is clustered on the filter column.
 On a 1M-row file (20 row groups) where the predicate selects ~one group:
@@ -183,9 +191,16 @@ On a 1M-row file (20 row groups) where the predicate selects ~one group:
 
 That's **~18× faster, −95% bytes, −96% allocs** — and against a range-capable
 `io.ReaderAt` (e.g. S3) it also fetches ~95% fewer bytes off the wire, since
-pruned groups' pages are never read. NULL values never match a value predicate.
-Filtering currently runs sequentially (`WithConcurrency` is ignored when `Where`
-is set).
+pruned groups' pages are never read.
+
+Page pruning sharpens this *within* a row group. On a single row group split into
+40 pages, a narrow `Between` over the (clustered) column read **4.3%** of the
+bytes of a full decode and ran ~43× faster — because only the matching pages are
+fetched and decoded. The win scales with how well the data is clustered on the
+filter column.
+
+NULL values never match a value predicate. Filtering currently runs sequentially
+(`WithConcurrency` is ignored when `Where` is set).
 
 ## Reading from S3 / remote storage
 
@@ -226,8 +241,10 @@ Measured against an in-memory reader that counts ranged reads (a stand-in for
 S3): a 2-column projection fetched **21%** of the bytes of a full decode, a
 selective `Where` fetched **19%**, and `WithOptimisticRead` cut open-time round
 trips from 10 to 7. If `WithConcurrency(n>1)` is used, `ReadAt` must be safe for
-concurrent calls (S3 `GetObject` is). Filtering applies to `Unmarshal`/
-`UnmarshalBytes`/`UnmarshalFile`, not the streaming `Reader`.
+concurrent calls (S3 `GetObject` is). `Where(...)` filtering works through every
+read API, including the streaming `Reader`, and row-group + page pruning mean a
+filtered remote read fetches only the footer, the page index, and the surviving
+pages.
 
 ---
 
@@ -484,7 +501,7 @@ Reproduce:
 ```sh
 go test -run='^$' -bench='BenchmarkShape' -benchmem -benchtime=10x
 go test -run='^$' -bench='BenchmarkLargeUnmarshal|BenchmarkSparseWide' -benchmem -benchtime=5x
-go test -run='^$' -bench='BenchmarkConcurrentDecode|BenchmarkProjection|BenchmarkFilter|BenchmarkPlanApply' -benchmem
+go test -run='^$' -bench='BenchmarkConcurrentDecode|BenchmarkProjection|BenchmarkFilter|BenchmarkPagePruning|BenchmarkPlanApply' -benchmem
 ```
 
 ---

@@ -183,6 +183,152 @@ func (cp compiledPred) bloomKeep(chunk parquet.ColumnChunk) bool {
 	return present
 }
 
+// pageCanMatch reports whether page p of the predicate's column might contain a
+// matching value, using the page index's per-page min/max and null flag.
+func (cp compiledPred) pageCanMatch(ci parquet.ColumnIndex, p int) bool {
+	if ci.NullPage(p) {
+		return false // all-null page can't satisfy a value predicate
+	}
+
+	minV := ci.MinValue(p)
+	maxV := ci.MaxValue(p)
+
+	switch cp.op {
+	case opEq:
+		return cp.typ.Compare(cp.lo, minV) >= 0 && cp.typ.Compare(cp.lo, maxV) <= 0
+	case opLt:
+		return cp.typ.Compare(minV, cp.lo) < 0
+	case opLe:
+		return cp.typ.Compare(minV, cp.lo) <= 0
+	case opGt:
+		return cp.typ.Compare(maxV, cp.lo) > 0
+	case opGe:
+		return cp.typ.Compare(maxV, cp.lo) >= 0
+	case opBetween:
+		return cp.typ.Compare(cp.hi, minV) >= 0 && cp.typ.Compare(cp.lo, maxV) <= 0
+	}
+
+	return true
+}
+
+// pageRanges returns the group-local row ranges [start,end) of pages in the
+// predicate's column that might match, using the column's page index. The second
+// result is false when no page index is available (so no page-level narrowing is
+// possible and the caller should not narrow on this predicate).
+func (cp compiledPred) pageRanges(rg parquet.RowGroup, groupRows int64) ([][2]int64, bool) {
+	chunks := rg.ColumnChunks()
+	if cp.col < 0 || cp.col >= len(chunks) {
+		return nil, false
+	}
+
+	cc, ok := chunks[cp.col].(*parquet.FileColumnChunk)
+	if !ok {
+		return nil, false
+	}
+
+	ci, err := cc.ColumnIndex()
+	if err != nil || ci == nil {
+		return nil, false
+	}
+
+	oi, err := cc.OffsetIndex()
+	if err != nil || oi == nil {
+		return nil, false
+	}
+
+	np := ci.NumPages()
+	if np == 0 || oi.NumPages() != np {
+		return nil, false
+	}
+
+	ranges := make([][2]int64, 0, np)
+
+	for p := 0; p < np; p++ {
+		if !cp.pageCanMatch(ci, p) {
+			continue
+		}
+
+		first := oi.FirstRowIndex(p)
+
+		last := groupRows
+		if p+1 < np {
+			last = oi.FirstRowIndex(p + 1)
+		}
+
+		ranges = append(ranges, [2]int64{first, last})
+	}
+
+	return mergeRanges(ranges), true
+}
+
+// candidateRanges returns the group-local row ranges that could contain a row
+// matching ALL predicates, intersecting each predicate's surviving page ranges.
+// Predicates whose column has no page index contribute no narrowing.
+func candidateRanges(rg parquet.RowGroup, preds []compiledPred) [][2]int64 {
+	groupRows := rg.NumRows()
+	cur := [][2]int64{{0, groupRows}}
+
+	for i := range preds {
+		pr, ok := preds[i].pageRanges(rg, groupRows)
+		if !ok {
+			continue
+		}
+
+		cur = intersectRanges(cur, pr)
+		if len(cur) == 0 {
+			return cur
+		}
+	}
+
+	return cur
+}
+
+// mergeRanges merges adjacent/overlapping ranges (input ordered by start).
+func mergeRanges(in [][2]int64) [][2]int64 {
+	if len(in) == 0 {
+		return nil
+	}
+
+	out := make([][2]int64, 0, len(in))
+	out = append(out, in[0])
+
+	for _, r := range in[1:] {
+		last := &out[len(out)-1]
+		if r[0] <= last[1] {
+			if r[1] > last[1] {
+				last[1] = r[1]
+			}
+		} else {
+			out = append(out, r)
+		}
+	}
+
+	return out
+}
+
+// intersectRanges intersects two sorted, disjoint range lists.
+func intersectRanges(a, b [][2]int64) [][2]int64 {
+	var out [][2]int64
+
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		lo := max(a[i][0], b[j][0])
+		hi := min(a[i][1], b[j][1])
+
+		if lo < hi {
+			out = append(out, [2]int64{lo, hi})
+		}
+
+		if a[i][1] < b[j][1] {
+			i++
+		} else {
+			j++
+		}
+	}
+
+	return out
+}
+
 // matchRow reports whether a single (non-null) row value satisfies the predicate.
 func (cp compiledPred) matchRow(v parquet.Value) bool {
 	if v.IsNull() {
