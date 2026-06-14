@@ -95,6 +95,15 @@ for {
 once the file is exhausted. Working memory stays bounded by `len(buf)` regardless
 of file size.
 
+Add `WithConcurrency(n)` to decode across cores while still streaming: workers
+decode whole row groups ahead of the consumer into a small look-ahead window, and
+`Read` delivers rows **in file order**. This works with `Where(...)` too. ~3.7×
+faster on a 20-row-group file. Memory stays bounded but rises to roughly
+`concurrency × rows-per-row-group` (the look-ahead), so it's most useful on files
+with many row groups; needs a concurrent-safe `io.ReaderAt` (`*os.File`,
+`*bytes.Reader`, S3 — same as the materialize path). A `Reader` is still single-
+consumer: call `Read` from one goroutine.
+
 ## Concurrent decoding
 
 Decode one file across multiple cores by fanning its row groups out to worker
@@ -549,7 +558,7 @@ Reproduce:
 ```sh
 go test -run='^$' -bench='BenchmarkShape' -benchmem -benchtime=10x
 go test -run='^$' -bench='BenchmarkLargeUnmarshal|BenchmarkSparseWide' -benchmem -benchtime=5x
-go test -run='^$' -bench='BenchmarkConcurrentDecode|BenchmarkProjection|BenchmarkFilter|BenchmarkPagePruning|BenchmarkPlanApply' -benchmem
+go test -run='^$' -bench='BenchmarkConcurrentDecode|BenchmarkStreamConcurrent|BenchmarkProjection|BenchmarkFilter|BenchmarkPagePruning|BenchmarkPlanApply' -benchmem
 ```
 
 ---
@@ -573,10 +582,11 @@ go test -run='^$' -bench='BenchmarkConcurrentDecode|BenchmarkProjection|Benchmar
   internal representations for the same instant. Float/byte-array timestamp
   encodings are a `Compile` error rather than a silent mis-decode.
 - **Concurrency.** A compiled `Plan` is read-only and safe to share across
-  goroutines. `Unmarshal` with `WithConcurrency(n>1)` decodes one file across
-  cores (needs a concurrent-safe `io.ReaderAt`; see
-  [Concurrent decoding](#concurrent-decoding)). A single `Reader` is not safe for
-  concurrent use; create one per goroutine.
+  goroutines. `WithConcurrency(n>1)` decodes one file across cores — on
+  `Unmarshal`/`UnmarshalBytes`/`UnmarshalFile` (with or without `Where`) and on
+  the streaming `Reader` — and needs a concurrent-safe `io.ReaderAt`; results are
+  always in file order. A single `Reader` is one consumer: call `Read` from one
+  goroutine (it manages its own internal workers).
 
 ---
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"sync"
 	"unsafe"
 
 	"github.com/parquet-go/parquet-go"
@@ -30,6 +31,140 @@ type Reader[T any] struct {
 	// filtered is non-nil when Where(...) was passed: Read then streams only
 	// matching rows, with row-group + page pruning. rows is unused in that mode.
 	filtered *filteredReader
+
+	// stream is non-nil when WithConcurrency(n>1) was passed: Read pulls rows
+	// from a bounded, order-preserving pool of workers decoding whole row groups.
+	stream *streamPipeline[T]
+}
+
+// groupResult carries one row group's decoded rows (or an error) to the consumer.
+type groupResult[T any] struct {
+	rows []T
+	err  error
+}
+
+// streamPipeline decodes row groups across worker goroutines and delivers them to
+// Read in file order, bounded to a small look-ahead window. Not safe for
+// concurrent use by multiple callers; the file's io.ReaderAt must allow
+// concurrent ReadAt.
+type streamPipeline[T any] struct {
+	ordered <-chan chan groupResult[T]
+	quit    chan struct{}
+	once    sync.Once
+
+	cur    []T
+	curPos int
+	done   bool
+}
+
+// startStreamPipeline launches workers that decode each group via decodeOne and a
+// dispatcher that hands out groups in file order, pushing each group's result
+// channel onto ordered (buffered to bound look-ahead to ~workers groups).
+func startStreamPipeline[T any](groups []parquet.RowGroup, workers int, decodeOne func(parquet.RowGroup) ([]T, error)) *streamPipeline[T] {
+	ordered := make(chan chan groupResult[T], workers)
+	quit := make(chan struct{})
+
+	type task struct {
+		rg parquet.RowGroup
+		rc chan groupResult[T]
+	}
+
+	tasks := make(chan task)
+
+	for w := 0; w < workers; w++ {
+		go func() {
+			for {
+				select {
+				case t, ok := <-tasks:
+					if !ok {
+						return
+					}
+
+					rows, err := decodeOne(t.rg)
+					select {
+					case t.rc <- groupResult[T]{rows: rows, err: err}:
+					case <-quit:
+						return
+					}
+				case <-quit:
+					return
+				}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(ordered)
+
+		for _, rg := range groups {
+			rc := make(chan groupResult[T], 1)
+
+			select {
+			case ordered <- rc: // backpressure: blocks when the window is full
+			case <-quit:
+				return
+			}
+
+			select {
+			case tasks <- task{rg: rg, rc: rc}:
+			case <-quit:
+				return
+			}
+		}
+
+		close(tasks)
+	}()
+
+	return &streamPipeline[T]{ordered: ordered, quit: quit}
+}
+
+// read drains the current group then the next ready groups (in file order) into
+// dst. Returns io.EOF once all groups are delivered (possibly with final rows).
+func (p *streamPipeline[T]) read(dst []T) (int, error) {
+	if p.done {
+		return 0, io.EOF
+	}
+
+	n := 0
+
+	for n < len(dst) {
+		if p.curPos >= len(p.cur) {
+			rc, ok := <-p.ordered
+			if !ok {
+				p.done = true
+
+				if n > 0 {
+					return n, nil
+				}
+
+				return 0, io.EOF
+			}
+
+			res := <-rc
+			if res.err != nil {
+				p.done = true
+
+				return n, res.err
+			}
+
+			p.cur = res.rows
+			p.curPos = 0
+
+			if len(p.cur) == 0 {
+				continue
+			}
+		}
+
+		c := copy(dst[n:], p.cur[p.curPos:])
+		p.curPos += c
+		n += c
+	}
+
+	return n, nil
+}
+
+func (p *streamPipeline[T]) close() {
+	p.once.Do(func() { close(p.quit) })
 }
 
 // NewReader opens the parquet file in r (an io.ReaderAt of size bytes) and
@@ -69,6 +204,8 @@ func NewReader[T any](r io.ReaderAt, size int64, opts ...Option) (*Reader[T], er
 		leafVals: make([][]parquet.Value, plan.NumLeaves()),
 	}
 
+	workers := cfg.workers()
+
 	// Where(...) → stream only matching rows, with row-group + page pruning.
 	if len(cfg.predicates) > 0 {
 		fr, err := newFilteredReader(f, cfg, plan, mask)
@@ -76,7 +213,35 @@ func NewReader[T any](r io.ReaderAt, size int64, opts ...Option) (*Reader[T], er
 			return nil, err
 		}
 
+		// Concurrent filtered streaming: filter row groups in parallel, deliver
+		// matches in file order.
+		if workers > 1 && len(fr.groups) > 1 {
+			rd.stream = startStreamPipeline(fr.groups, min(workers, len(fr.groups)),
+				func(rg parquet.RowGroup) ([]T, error) {
+					return filterGroup[T](rg, plan, &fr.root, cfg.batchSize)
+				})
+
+			return rd, nil
+		}
+
 		rd.filtered = fr
+
+		return rd, nil
+	}
+
+	// Concurrent (unfiltered) streaming: decode whole row groups in parallel,
+	// deliver in file order. Memory ≈ concurrency × rows-per-row-group, so it is
+	// most useful on files with many row groups.
+	if workers > 1 && len(rgs) > 1 {
+		masked := make([]parquet.RowGroup, len(rgs))
+		for i, rg := range rgs {
+			masked[i] = NewMaskedRowGroup(rg, mask)
+		}
+
+		rd.stream = startStreamPipeline(masked, min(workers, len(masked)),
+			func(rg parquet.RowGroup) ([]T, error) {
+				return decodeGroup[T](rg, plan, cfg.batchSize)
+			})
 
 		return rd, nil
 	}
@@ -114,6 +279,10 @@ func (rd *Reader[T]) File() *parquet.File {
 //	    if err != nil { return err }
 //	}
 func (rd *Reader[T]) Read(dst []T) (int, error) {
+	if rd.stream != nil {
+		return rd.stream.read(dst)
+	}
+
 	if rd.done {
 		return 0, io.EOF
 	}
@@ -173,6 +342,12 @@ func (rd *Reader[T]) Read(dst []T) (int, error) {
 
 // Close releases the underlying row reader.
 func (rd *Reader[T]) Close() error {
+	if rd.stream != nil {
+		rd.stream.close()
+
+		return nil
+	}
+
 	if rd.filtered != nil {
 		if err := rd.filtered.close(); err != nil {
 			return fmt.Errorf("close parquet rows: %w", err)

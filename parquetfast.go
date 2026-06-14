@@ -494,6 +494,45 @@ func filterGroup[T any](rg parquet.RowGroup, plan *Plan, root *compiledPredicate
 	return out[:w], nil
 }
 
+// decodeGroup decodes every row of one (masked) row group into a fresh slice.
+// Used by the concurrent streaming pipeline; each call has its own reader and
+// scratch so groups decode concurrently (the io.ReaderAt must allow concurrent
+// ReadAt).
+func decodeGroup[T any](rg parquet.RowGroup, plan *Plan, batchSize int) (_ []T, err error) {
+	if batchSize < 1 {
+		batchSize = 16
+	}
+
+	n := int(rg.NumRows())
+	out := make([]T, n)
+
+	if n == 0 {
+		return out, nil
+	}
+
+	rows := rg.Rows()
+
+	defer func() {
+		if cerr := rows.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("close parquet rows: %w", cerr)
+		}
+	}()
+
+	rowBatch := make([]parquet.Row, batchSize)
+	leafVals := make([][]parquet.Value, plan.NumLeaves())
+
+	read, derr := decodeRowsInto(rows, plan, out, rowBatch, leafVals)
+	if derr != nil {
+		return nil, derr
+	}
+
+	if read != n {
+		return nil, fmt.Errorf("decoded %d rows but row group reports %d", read, n)
+	}
+
+	return out[:read], nil
+}
+
 // filteredReader drives predicate-filtered decoding with row-group + page pruning
 // and page-aligned seeks. Shared by the materialize-all filtered path and the
 // streaming Reader. Not safe for concurrent use.
