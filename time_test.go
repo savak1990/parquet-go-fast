@@ -36,6 +36,8 @@ type tsRow struct {
 }
 
 func TestTime_TimestampNanosDefault(t *testing.T) {
+	t.Parallel()
+
 	opt := time.Date(2020, 3, 4, 5, 6, 7, 8, time.UTC)
 	in := []tsRow{
 		{ID: 1, When: time.Date(2026, 6, 13, 10, 30, 0, 123456789, time.UTC), Opt: &opt},
@@ -85,6 +87,8 @@ type unitRow struct {
 }
 
 func TestTime_TaggedUnits(t *testing.T) {
+	t.Parallel()
+
 	in := []unitRow{
 		{
 			Millis: time.Date(2026, 1, 2, 3, 4, 5, 678000000, time.UTC), // ms precision
@@ -123,6 +127,8 @@ type dateRead struct {
 }
 
 func TestTime_DateColumn(t *testing.T) {
+	t.Parallel()
+
 	days := func(y int, m time.Month, d int) int32 {
 		return int32(time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Unix() / 86400)
 	}
@@ -166,6 +172,8 @@ type nestedTimeRow struct {
 }
 
 func TestTime_Nested(t *testing.T) {
+	t.Parallel()
+
 	t0 := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 	t1 := time.Date(2026, 6, 2, 1, 2, 3, 400000000, time.UTC)
 
@@ -231,6 +239,8 @@ func TestTime_Nested(t *testing.T) {
 // A time.Time field written with a non-supported physical encoding should fail
 // loudly at Compile rather than silently decoding zero.
 func TestTime_UnsupportedEncodingErrors(t *testing.T) {
+	t.Parallel()
+
 	type floatTimeRow struct {
 		T time.Time `parquet:"t,timestamp"` // ensure a normal one compiles fine
 	}
@@ -245,6 +255,8 @@ func TestTime_UnsupportedEncodingErrors(t *testing.T) {
 // Sanity check that the probe-style raw schema is a single INT64 leaf (guards
 // against accidental struct-recursion regressions).
 func TestTime_SingleLeafSchema(t *testing.T) {
+	t.Parallel()
+
 	buf := writeGeneric(t, []tsRow{{ID: 1, When: time.Unix(0, 0).UTC()}})
 
 	f, err := parquet.OpenFile(bytes.NewReader(buf), int64(len(buf)))

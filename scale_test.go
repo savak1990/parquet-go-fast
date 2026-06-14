@@ -22,7 +22,13 @@ import (
 // These write hundreds of MB and take tens of seconds; `go test -short` skips
 // them.
 
-const millionRows = 1_000_000
+// millionRows drives the concurrent-from-file soak (TestConcurrent_MillionFromFile);
+// scaleRows drives the streaming scale tests — large enough for ~10 row groups and
+// to exercise streaming/accumulation, without the full-million wall-clock cost.
+const (
+	millionRows = 1_000_000
+	scaleRows   = 250_000
+)
 
 // ── merchant aggregates ──────────────────────────────────────────────────────
 
@@ -106,13 +112,15 @@ func writeMerchantFile(tb testing.TB, path string, n, rowsPerRG int) merchAgg {
 	return want
 }
 
-func TestMerchantMillionStream(t *testing.T) {
+func TestMerchantStreamAtScale(t *testing.T) {
+	t.Parallel()
+
 	if testing.Short() {
-		t.Skip("skipping million-row scale test in -short mode")
+		t.Skip("skipping scale test in -short mode")
 	}
 
 	path := filepath.Join(t.TempDir(), "merchants.parquet")
-	want := writeMerchantFile(t, path, millionRows, 100_000) // ~10 row groups
+	want := writeMerchantFile(t, path, scaleRows, 25_000) // ~10 row groups
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -125,7 +133,7 @@ func TestMerchantMillionStream(t *testing.T) {
 		t.Fatalf("stat: %v", err)
 	}
 
-	t.Logf("file: %d bytes on disk for %d rows", fi.Size(), millionRows)
+	t.Logf("file: %d bytes on disk for %d rows", fi.Size(), scaleRows)
 
 	rd, err := parquetfast.NewReader[merchantDay](f, fi.Size())
 	if err != nil {
@@ -133,8 +141,8 @@ func TestMerchantMillionStream(t *testing.T) {
 	}
 	defer func() { _ = rd.Close() }()
 
-	if rd.NumRows() != millionRows {
-		t.Fatalf("NumRows = %d, want %d", rd.NumRows(), millionRows)
+	if rd.NumRows() != scaleRows {
+		t.Fatalf("NumRows = %d, want %d", rd.NumRows(), scaleRows)
 	}
 
 	var got merchAgg
@@ -224,13 +232,15 @@ func writeWarehouseFile(tb testing.TB, path string, n, rowsPerRG int) whAgg {
 	return want
 }
 
-func TestWarehouseMillionStream(t *testing.T) {
+func TestWarehouseStreamAtScale(t *testing.T) {
+	t.Parallel()
+
 	if testing.Short() {
-		t.Skip("skipping million-row scale test in -short mode")
+		t.Skip("skipping scale test in -short mode")
 	}
 
 	path := filepath.Join(t.TempDir(), "warehouses.parquet")
-	want := writeWarehouseFile(t, path, millionRows, 100_000)
+	want := writeWarehouseFile(t, path, scaleRows, 25_000)
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -243,7 +253,7 @@ func TestWarehouseMillionStream(t *testing.T) {
 		t.Fatalf("stat: %v", err)
 	}
 
-	t.Logf("file: %d bytes on disk for %d rows", fi.Size(), millionRows)
+	t.Logf("file: %d bytes on disk for %d rows", fi.Size(), scaleRows)
 
 	rd, err := parquetfast.NewReader[warehouseDay](f, fi.Size())
 	if err != nil {
@@ -251,8 +261,8 @@ func TestWarehouseMillionStream(t *testing.T) {
 	}
 	defer func() { _ = rd.Close() }()
 
-	if rd.NumRows() != millionRows {
-		t.Fatalf("NumRows = %d, want %d", rd.NumRows(), millionRows)
+	if rd.NumRows() != scaleRows {
+		t.Fatalf("NumRows = %d, want %d", rd.NumRows(), scaleRows)
 	}
 
 	var got whAgg

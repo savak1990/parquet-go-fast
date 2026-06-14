@@ -23,6 +23,8 @@ func streamDecode[T any](t *testing.T, data []byte, opts ...parquetfast.Option) 
 }
 
 func TestStreamConcurrent_Unfiltered(t *testing.T) {
+	t.Parallel()
+
 	rows := make([]merchantDay, 1000)
 	for i := range rows {
 		rows[i] = makeMerchant(i+1, i%6)
@@ -51,6 +53,8 @@ func TestStreamConcurrent_Unfiltered(t *testing.T) {
 }
 
 func TestStreamConcurrent_Filtered(t *testing.T) {
+	t.Parallel()
+
 	rows := make([]filterRow, 4000)
 	for i := range rows {
 		rows[i] = makeFilterRow(i)
@@ -87,6 +91,8 @@ func TestStreamConcurrent_Filtered(t *testing.T) {
 // Varying the caller buffer size must not change results (group boundaries fall
 // at arbitrary points relative to dst).
 func TestStreamConcurrent_BufferSizes(t *testing.T) {
+	t.Parallel()
+
 	rows := make([]scalarRow, 2000)
 	for i := range rows {
 		rows[i] = scalarRow{S: "r", I64: int64(i), Bs: []byte{byte(i)}}
@@ -127,6 +133,8 @@ func TestStreamConcurrent_BufferSizes(t *testing.T) {
 
 // Closing after a partial read must not deadlock or leak goroutines.
 func TestStreamConcurrent_PartialReadThenClose(t *testing.T) {
+	t.Parallel()
+
 	rows := make([]merchantDay, 2000)
 	for i := range rows {
 		rows[i] = makeMerchant(i+1, i%4)

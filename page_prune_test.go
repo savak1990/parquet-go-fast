@@ -68,6 +68,8 @@ func streamAll[T any](t *testing.T, rd *parquetfast.Reader[T]) []T {
 }
 
 func TestPagePruning_SingleGroupReadsFewerBytes(t *testing.T) {
+	t.Parallel()
+
 	data := ppFixture(t, 20000)
 
 	// Confirm single row group with multiple pages (so it's page pruning).
@@ -85,7 +87,7 @@ func TestPagePruning_SingleGroupReadsFewerBytes(t *testing.T) {
 	t.Logf("single row group, %d pages on the id column", ci.NumPages())
 
 	read := func(opts ...parquetfast.Option) int64 {
-		cr := &countingReaderAt{r: bytes.NewReader(data)}
+		cr := newRemoteReaderAt(data)
 		if _, err := parquetfast.Unmarshal[ppRow](cr, int64(len(data)), opts...); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
@@ -121,6 +123,8 @@ func TestPagePruning_SingleGroupReadsFewerBytes(t *testing.T) {
 // UnmarshalBytes, UnmarshalFile, Unmarshal (remote io.ReaderAt / S3), and the
 // streaming Reader.
 func TestPagePruning_AllAPIsAgree(t *testing.T) {
+	t.Parallel()
+
 	data := ppFixture(t, 10000)
 	pred := parquetfast.Where(parquetfast.Col("id").Between(int64(3000), int64(3050)))
 
@@ -170,7 +174,7 @@ func TestPagePruning_AllAPIsAgree(t *testing.T) {
 	equal("UnmarshalFile", got)
 
 	// Unmarshal over a remote-style io.ReaderAt (S3 stand-in)
-	got, err = parquetfast.Unmarshal[ppRow](&remoteReaderAt{data: data}, int64(len(data)), pred)
+	got, err = parquetfast.Unmarshal[ppRow](newRemoteReaderAt(data), int64(len(data)), pred)
 	if err != nil {
 		t.Fatalf("Unmarshal(remote): %v", err)
 	}
@@ -186,10 +190,12 @@ func TestPagePruning_AllAPIsAgree(t *testing.T) {
 }
 
 func TestPagePruning_StreamingReaderRemote(t *testing.T) {
+	t.Parallel()
+
 	data := ppFixture(t, 10000)
 
 	// Streaming filtered read from a remote-style reader, counting bytes.
-	rr := &remoteReaderAt{data: data}
+	rr := newRemoteReaderAt(data)
 
 	rd, err := parquetfast.NewReader[ppRow](rr, int64(len(data)),
 		parquetfast.Where(parquetfast.Col("id").Between(int64(8000), int64(8020))))
@@ -218,6 +224,8 @@ func TestPagePruning_StreamingReaderRemote(t *testing.T) {
 }
 
 func TestPagePruning_MultiPredicate(t *testing.T) {
+	t.Parallel()
+
 	data := ppFixture(t, 10000)
 
 	// id range narrows by pages; cat is unclustered (won't page-prune) but must

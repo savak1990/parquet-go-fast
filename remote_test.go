@@ -2,7 +2,6 @@ package parquetfast_test
 
 import (
 	"bytes"
-	"sync/atomic"
 	"testing"
 
 	"github.com/parquet-go/parquet-go"
@@ -10,39 +9,12 @@ import (
 	parquetfast "github.com/savak1990/parquet-go-fast"
 )
 
-// remoteReaderAt simulates object storage: it serves bytes from an in-memory
-// buffer via ReadAt (like an S3 GetObject with a Range header) and counts calls
-// (round trips) and bytes transferred — the two things that cost money/latency
-// on real remote storage.
-type remoteReaderAt struct {
-	data  []byte
-	calls atomic.Int64
-	bytes atomic.Int64
-}
-
-func (r *remoteReaderAt) ReadAt(p []byte, off int64) (int, error) {
-	r.calls.Add(1)
-
-	n := copy(p, r.data[off:])
-	r.bytes.Add(int64(n))
-
-	if n < len(p) {
-		return n, bytesErrEOF
-	}
-
-	return n, nil
-}
-
-// bytesErrEOF mirrors what bytes.Reader.ReadAt returns for a short read.
-var bytesErrEOF = bytesReaderEOF()
-
-func bytesReaderEOF() error {
-	_, err := bytes.NewReader(nil).ReadAt(make([]byte, 1), 0)
-
-	return err
-}
+// Remote/object-storage behavior is metered with instrumentedReaderAt (see
+// helpers_test.go), which counts ReadAt round trips and bytes transferred.
 
 func TestRemote_DecodeMatchesBytes(t *testing.T) {
+	t.Parallel()
+
 	data := writeServiceFixture(t, 500, 100)
 
 	want, err := parquetfast.UnmarshalBytes[serviceRollup](data)
@@ -50,7 +22,7 @@ func TestRemote_DecodeMatchesBytes(t *testing.T) {
 		t.Fatalf("bytes decode: %v", err)
 	}
 
-	rr := &remoteReaderAt{data: data}
+	rr := newRemoteReaderAt(data)
 
 	got, err := parquetfast.Unmarshal[serviceRollup](rr, int64(len(data)))
 	if err != nil {
@@ -65,6 +37,8 @@ func TestRemote_DecodeMatchesBytes(t *testing.T) {
 }
 
 func TestRemote_ReaderAtFunc(t *testing.T) {
+	t.Parallel()
+
 	data := writeServiceFixture(t, 100, 50)
 
 	src := bytes.NewReader(data)
@@ -83,10 +57,12 @@ func TestRemote_ReaderAtFunc(t *testing.T) {
 }
 
 func TestRemote_ProjectionFetchesFewerBytes(t *testing.T) {
+	t.Parallel()
+
 	data := writeServiceFixture(t, 2000, 200)
 
 	// Full struct over remote.
-	full := &remoteReaderAt{data: data}
+	full := newRemoteReaderAt(data)
 	if _, err := parquetfast.Unmarshal[serviceRollup](full, int64(len(data))); err != nil {
 		t.Fatalf("full: %v", err)
 	}
@@ -97,7 +73,7 @@ func TestRemote_ProjectionFetchesFewerBytes(t *testing.T) {
 		Window  int64  `parquet:"window"`
 	}
 
-	narrow := &remoteReaderAt{data: data}
+	narrow := newRemoteReaderAt(data)
 	if _, err := parquetfast.Unmarshal[slim](narrow, int64(len(data))); err != nil {
 		t.Fatalf("narrow: %v", err)
 	}
@@ -112,6 +88,8 @@ func TestRemote_ProjectionFetchesFewerBytes(t *testing.T) {
 }
 
 func TestRemote_FilterFetchesFewerBytes(t *testing.T) {
+	t.Parallel()
+
 	// Monotonic id across 20 row groups so a range predicate prunes most.
 	rows := make([]filterRow, 2000)
 	for i := range rows {
@@ -120,12 +98,12 @@ func TestRemote_FilterFetchesFewerBytes(t *testing.T) {
 
 	data := writeGeneric(t, rows, parquet.MaxRowsPerRowGroup(100))
 
-	full := &remoteReaderAt{data: data}
+	full := newRemoteReaderAt(data)
 	if _, err := parquetfast.Unmarshal[filterRow](full, int64(len(data))); err != nil {
 		t.Fatalf("full: %v", err)
 	}
 
-	filt := &remoteReaderAt{data: data}
+	filt := newRemoteReaderAt(data)
 	got, err := parquetfast.Unmarshal[filterRow](filt, int64(len(data)),
 		parquetfast.Where(parquetfast.Col("id").Between(int64(150), int64(160))))
 	if err != nil {
@@ -146,18 +124,20 @@ func TestRemote_FilterFetchesFewerBytes(t *testing.T) {
 }
 
 func TestRemote_OptimisticReadReducesRoundTrips(t *testing.T) {
+	t.Parallel()
+
 	data := writeServiceFixture(t, 1000, 200)
 
 	type slim struct {
 		Service string `parquet:"service"`
 	}
 
-	base := &remoteReaderAt{data: data}
+	base := newRemoteReaderAt(data)
 	if _, err := parquetfast.Unmarshal[slim](base, int64(len(data))); err != nil {
 		t.Fatalf("baseline: %v", err)
 	}
 
-	opt := &remoteReaderAt{data: data}
+	opt := newRemoteReaderAt(data)
 	if _, err := parquetfast.Unmarshal[slim](opt, int64(len(data)),
 		parquetfast.WithOptimisticRead(), parquetfast.WithReadBufferSize(1<<20)); err != nil {
 		t.Fatalf("optimistic: %v", err)

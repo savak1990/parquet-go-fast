@@ -207,6 +207,8 @@ func BenchmarkSparseWide(b *testing.B) {
 // Verify the fixture really has an all-null tail (so the benchmark measures what
 // we claim) and that decoding is correct.
 func TestSparseWide_FixtureIsSparseAndDecodes(t *testing.T) {
+	t.Parallel()
+
 	data := writeServiceFixture(t, 200, 64)
 
 	f, _ := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
@@ -234,6 +236,8 @@ func TestSparseWide_FixtureIsSparseAndDecodes(t *testing.T) {
 
 // Quick disk-path sanity for UnmarshalFile on the sparse shape.
 func TestSparseWide_UnmarshalFile(t *testing.T) {
+	t.Parallel()
+
 	data := writeServiceFixture(t, 100, 64)
 
 	path := filepath.Join(t.TempDir(), "svc.parquet")

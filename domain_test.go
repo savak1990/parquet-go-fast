@@ -266,6 +266,8 @@ func makeWarehouse(seed int) warehouseDay {
 // ── Roundtrip correctness ────────────────────────────────────────────────────
 
 func TestMerchantRoundtrip(t *testing.T) {
+	t.Parallel()
+
 	rows := []merchantDay{
 		makeMerchant(1, 0),  // no products, varied optionals
 		makeMerchant(2, 1),  // one product
@@ -279,6 +281,8 @@ func TestMerchantRoundtrip(t *testing.T) {
 }
 
 func TestWarehouseRoundtrip(t *testing.T) {
+	t.Parallel()
+
 	rows := []warehouseDay{
 		makeWarehouse(1),
 		makeWarehouse(2),
@@ -292,6 +296,8 @@ func TestWarehouseRoundtrip(t *testing.T) {
 // TestMerchantMultiRowGroupRoundtrip writes enough rows to force several row
 // groups and verifies a full, exact decode across the group boundary.
 func TestMerchantMultiRowGroupRoundtrip(t *testing.T) {
+	t.Parallel()
+
 	const n = 300
 
 	rows := make([]merchantDay, n)

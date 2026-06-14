@@ -29,6 +29,8 @@ func multiRGMerchants(t *testing.T, n, rowsPerRG int) []byte {
 }
 
 func TestConcurrent_MatchesSequential(t *testing.T) {
+	t.Parallel()
+
 	buf := multiRGMerchants(t, 1000, 80) // ~13 row groups
 
 	f, _ := parquet.OpenFile(bytes.NewReader(buf), int64(len(buf)))
@@ -61,6 +63,8 @@ func TestConcurrent_MatchesSequential(t *testing.T) {
 }
 
 func TestConcurrent_SingleRowGroupFallback(t *testing.T) {
+	t.Parallel()
+
 	// One row group → concurrency can't split it; must still decode correctly.
 	rows := make([]merchantDay, 200)
 	for i := range rows {
@@ -86,6 +90,8 @@ func TestConcurrent_SingleRowGroupFallback(t *testing.T) {
 }
 
 func TestConcurrent_Empty(t *testing.T) {
+	t.Parallel()
+
 	buf := writeGeneric(t, []merchantDay{})
 
 	got, err := parquetfast.UnmarshalBytes[merchantDay](buf, parquetfast.WithConcurrency(8))
@@ -101,6 +107,8 @@ func TestConcurrent_Empty(t *testing.T) {
 // Million-row concurrent decode from disk (os.File ReadAt is concurrent-safe),
 // verifying order-independent aggregates match the generated expectation.
 func TestConcurrent_MillionFromFile(t *testing.T) {
+	t.Parallel()
+
 	if testing.Short() {
 		t.Skip("skipping million-row concurrent test in -short mode")
 	}

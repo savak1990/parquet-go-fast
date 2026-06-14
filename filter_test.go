@@ -69,6 +69,8 @@ func assertFilter(t *testing.T, data []byte, want func(filterRow) bool, preds ..
 }
 
 func TestFilter_Operators(t *testing.T) {
+	t.Parallel()
+
 	data := filterFixture(t, 300, 50) // 6 row groups, ids monotonic
 
 	assertFilter(t, data, func(r filterRow) bool { return r.ID == 42 },
@@ -94,6 +96,8 @@ func TestFilter_Operators(t *testing.T) {
 }
 
 func TestFilter_OnColumnNotInStruct(t *testing.T) {
+	t.Parallel()
+
 	data := filterFixture(t, 300, 50)
 
 	// Destination omits Region; filter on it anyway.
@@ -119,6 +123,8 @@ func TestFilter_OnColumnNotInStruct(t *testing.T) {
 }
 
 func TestFilter_PrunesRowGroups(t *testing.T) {
+	t.Parallel()
+
 	data := filterFixture(t, 2000, 100) // 20 row groups, ids [0,100),[100,200),...
 
 	// Confirm the writer recorded min/max stats (otherwise pruning can't fire).
@@ -129,7 +135,7 @@ func TestFilter_PrunesRowGroups(t *testing.T) {
 	}
 
 	read := func(opts ...parquetfast.Option) int64 {
-		cr := &countingReaderAt{r: bytes.NewReader(data)}
+		cr := newRemoteReaderAt(data)
 		if _, err := parquetfast.Unmarshal[filterRow](cr, int64(len(data)), opts...); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
@@ -162,6 +168,8 @@ func TestFilter_PrunesRowGroups(t *testing.T) {
 }
 
 func TestFilter_TimeRange(t *testing.T) {
+	t.Parallel()
+
 	type tfRow struct {
 		ID   int64     `parquet:"id"`
 		When time.Time `parquet:"when"`
@@ -196,6 +204,8 @@ func TestFilter_TimeRange(t *testing.T) {
 }
 
 func TestFilter_BloomPrunesEqualityMiss(t *testing.T) {
+	t.Parallel()
+
 	rows := make([]filterRow, 1000)
 	for i := range rows {
 		rows[i] = makeFilterRow(i)
@@ -315,6 +325,8 @@ func BenchmarkFilter(b *testing.B) {
 }
 
 func TestFilter_ConcurrentMatchesSequential(t *testing.T) {
+	t.Parallel()
+
 	// Multi-row-group file so concurrency parallelizes across groups.
 	rows := make([]filterRow, 4000)
 	for i := range rows {
@@ -353,6 +365,8 @@ func TestFilter_ConcurrentMatchesSequential(t *testing.T) {
 }
 
 func TestFilter_Or(t *testing.T) {
+	t.Parallel()
+
 	data := filterFixture(t, 300, 50)
 
 	assertFilter(t, data, func(r filterRow) bool { return r.ID < 10 || r.ID > 290 },
@@ -370,6 +384,8 @@ func TestFilter_Or(t *testing.T) {
 }
 
 func TestFilter_NestedAndOr(t *testing.T) {
+	t.Parallel()
+
 	data := filterFixture(t, 300, 50)
 
 	// region == "eu" AND (id < 50 OR id > 250)
@@ -385,6 +401,8 @@ func TestFilter_NestedAndOr(t *testing.T) {
 }
 
 func TestFilter_OrPrunesRowGroups(t *testing.T) {
+	t.Parallel()
+
 	data := filterFixture(t, 2000, 100) // 20 row groups, ids [g*100,(g+1)*100)
 
 	f, _ := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
@@ -394,7 +412,7 @@ func TestFilter_OrPrunesRowGroups(t *testing.T) {
 	}
 
 	read := func(opts ...parquetfast.Option) int64 {
-		cr := &countingReaderAt{r: bytes.NewReader(data)}
+		cr := newRemoteReaderAt(data)
 		if _, err := parquetfast.Unmarshal[filterRow](cr, int64(len(data)), opts...); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
@@ -432,6 +450,8 @@ func TestFilter_OrPrunesRowGroups(t *testing.T) {
 }
 
 func TestFilter_NotEqualAndNot(t *testing.T) {
+	t.Parallel()
+
 	data := filterFixture(t, 300, 50)
 
 	// NotEqual leaf.
@@ -460,6 +480,8 @@ func TestFilter_NotEqualAndNot(t *testing.T) {
 }
 
 func TestFilter_NotEqualPrunesConstantGroup(t *testing.T) {
+	t.Parallel()
+
 	// One column is constant within each row group, so != that constant prunes
 	// the matching group entirely (min == max == value).
 	type cgRow struct {
@@ -489,7 +511,7 @@ func TestFilter_NotEqualPrunesConstantGroup(t *testing.T) {
 	}
 
 	read := func(opts ...parquetfast.Option) int64 {
-		cr := &countingReaderAt{r: bytes.NewReader(data)}
+		cr := newRemoteReaderAt(data)
 		if _, err := parquetfast.Unmarshal[cgRow](cr, int64(len(data)), opts...); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
@@ -518,6 +540,8 @@ func TestFilter_NotEqualPrunesConstantGroup(t *testing.T) {
 }
 
 func TestFilter_In(t *testing.T) {
+	t.Parallel()
+
 	data := filterFixture(t, 300, 50)
 
 	// String set.
@@ -538,6 +562,8 @@ func TestFilter_In(t *testing.T) {
 }
 
 func TestFilter_InPrunesRowGroups(t *testing.T) {
+	t.Parallel()
+
 	data := filterFixture(t, 2000, 100) // 20 groups, ids [g*100,(g+1)*100)
 
 	f, _ := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
@@ -546,7 +572,7 @@ func TestFilter_InPrunesRowGroups(t *testing.T) {
 	}
 
 	read := func(opts ...parquetfast.Option) int64 {
-		cr := &countingReaderAt{r: bytes.NewReader(data)}
+		cr := newRemoteReaderAt(data)
 		if _, err := parquetfast.Unmarshal[filterRow](cr, int64(len(data)), opts...); err != nil {
 			t.Fatalf("decode: %v", err)
 		}

@@ -66,6 +66,8 @@ type scalarRow struct {
 }
 
 func TestScalars(t *testing.T) {
+	t.Parallel()
+
 	rows := make([]scalarRow, 4)
 	for i := range rows {
 		rows[i] = scalarRow{
@@ -103,6 +105,8 @@ type optionalRow struct {
 }
 
 func TestOptionals(t *testing.T) {
+	t.Parallel()
+
 	s := "hello"
 	b := true
 	i := 7
@@ -134,6 +138,8 @@ type primitiveSliceRow struct {
 }
 
 func TestPrimitiveSlices(t *testing.T) {
+	t.Parallel()
+
 	rows := []primitiveSliceRow{
 		{
 			Strs: []string{"a", "b", "c"},
@@ -169,6 +175,8 @@ type requiredStructRow struct {
 }
 
 func TestRequiredStruct(t *testing.T) {
+	t.Parallel()
+
 	rows := []requiredStructRow{
 		{Name: "one", Inner: inner{A: "x", B: 1}},
 		{Name: "two", Inner: inner{A: "y", B: 2}},
@@ -189,6 +197,8 @@ type wideRead struct {
 }
 
 func TestSchemaEvolution(t *testing.T) {
+	t.Parallel()
+
 	buf := writeGeneric(t, []narrowWrite{{A: "x"}, {A: "y"}})
 
 	got, err := parquetfast.UnmarshalBytes[wideRead](buf)
@@ -205,6 +215,8 @@ func TestSchemaEvolution(t *testing.T) {
 // ── Empty file ───────────────────────────────────────────────────────────────
 
 func TestEmpty(t *testing.T) {
+	t.Parallel()
+
 	buf := writeGeneric(t, []scalarRow{})
 
 	got, err := parquetfast.UnmarshalBytes[scalarRow](buf)
@@ -218,6 +230,8 @@ func TestEmpty(t *testing.T) {
 }
 
 func TestUnmarshalFile(t *testing.T) {
+	t.Parallel()
+
 	rows := []scalarRow{
 		{S: "a", I64: 1, Bs: []byte{1}},
 		{S: "b", I64: 2, Bs: []byte{2}},

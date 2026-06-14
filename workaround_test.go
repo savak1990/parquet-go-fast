@@ -18,6 +18,8 @@ type rowMapOfPrimSlice struct {
 }
 
 func TestWorkaround_MapOfPrimitiveSlice(t *testing.T) {
+	t.Parallel()
+
 	rows := []rowMapOfPrimSlice{
 		{Name: "a", M: map[string]wrapPrimSlice{
 			"x": {Vals: []int64{1, 2, 3}},
@@ -42,6 +44,8 @@ type rowSliceOfMap struct {
 }
 
 func TestWorkaround_SliceOfMap(t *testing.T) {
+	t.Parallel()
+
 	rows := []rowSliceOfMap{
 		{Name: "a", Items: []wrapMap{
 			{M: map[string]int64{"p": 1, "q": 2}},
@@ -71,6 +75,8 @@ type rowMapOfStructSlice struct {
 }
 
 func TestWorkaround_MapOfStructSlice(t *testing.T) {
+	t.Parallel()
+
 	rows := []rowMapOfStructSlice{
 		{Name: "a", M: map[string]wrapStructSlice{
 			"x": {Items: []leafStruct{{A: "p", B: 1}, {A: "q", B: 2}}},
@@ -95,6 +101,8 @@ type rowMapOfStructMap struct {
 }
 
 func TestWorkaround_MapOfStructValuedMap(t *testing.T) {
+	t.Parallel()
+
 	rows := []rowMapOfStructMap{
 		{Name: "a", M: map[string]wrapStructMap{
 			"x": {Inner: map[string]leafStruct{"p": {A: "p", B: 1}, "q": {A: "q", B: 2}}},

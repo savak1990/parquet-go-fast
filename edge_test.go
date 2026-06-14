@@ -21,6 +21,8 @@ type signedRow struct {
 }
 
 func TestEdge_SignedRanges(t *testing.T) {
+	t.Parallel()
+
 	rows := []signedRow{
 		{I8: math.MinInt8, I16: math.MinInt16, I32: math.MinInt32, I64: math.MinInt64, I: math.MinInt32},
 		{I8: math.MaxInt8, I16: math.MaxInt16, I32: math.MaxInt32, I64: math.MaxInt64, I: math.MaxInt32},
@@ -42,6 +44,8 @@ type unsignedRow struct {
 }
 
 func TestEdge_UnsignedRanges(t *testing.T) {
+	t.Parallel()
+
 	rows := []unsignedRow{
 		{U8: 0, U16: 0, U32: 0, U64: 0},
 		{U8: math.MaxUint8, U16: math.MaxUint16, U32: math.MaxUint32, U64: math.MaxUint64},
@@ -62,6 +66,8 @@ type optZeroRow struct {
 }
 
 func TestEdge_OptionalZeroVsNil(t *testing.T) {
+	t.Parallel()
+
 	z := int64(0)
 	es := ""
 	bf := false
@@ -91,6 +97,8 @@ type namedRow struct {
 }
 
 func TestEdge_NamedTypes(t *testing.T) {
+	t.Parallel()
+
 	rows := []namedRow{
 		{Cur: "USD", Total: 1999, Stars: 5, Score: 9.5, Tags: []Currency{"USD", "EUR"}},
 		{Cur: "JPY", Total: -50, Stars: 0, Score: -1.25, Tags: []Currency{"JPY"}},
@@ -110,6 +118,8 @@ type namedMapRow struct {
 }
 
 func TestEdge_NamedMapKeys(t *testing.T) {
+	t.Parallel()
+
 	rows := []namedMapRow{
 		{
 			ByRegion: map[Region]int64{"us": 1, "eu": 2},
@@ -148,6 +158,8 @@ type deepRow struct {
 }
 
 func TestEdge_DeepNesting(t *testing.T) {
+	t.Parallel()
+
 	rows := []deepRow{
 		{ID: "a", L1: level1{
 			Name:  "l1a",
@@ -172,6 +184,8 @@ type floatRow struct {
 }
 
 func TestEdge_FloatSpecials(t *testing.T) {
+	t.Parallel()
+
 	rows := []floatRow{
 		{A: math.Inf(1), B: float32(math.Inf(1))},
 		{A: math.Inf(-1), B: float32(math.Inf(-1))},
@@ -192,6 +206,8 @@ type keyKindsRow struct {
 }
 
 func TestEdge_MapKeyKinds(t *testing.T) {
+	t.Parallel()
+
 	rows := []keyKindsRow{
 		{
 			I32K: map[int32]string{1: "a", -5: "b"},
@@ -220,6 +236,8 @@ type int64MapRow struct {
 }
 
 func TestEdge_Int64KeyedStructMap(t *testing.T) {
+	t.Parallel()
+
 	rows := []int64MapRow{
 		{Throttles: map[int64]throttle{1: {Limit: 10, Burst: 20}, 2: {Limit: 30, Burst: 40}}},
 		{Throttles: map[int64]throttle{100: {Limit: 1, Burst: 2}}},
@@ -236,6 +254,8 @@ type bigCardRow struct {
 }
 
 func TestEdge_HighCardinality(t *testing.T) {
+	t.Parallel()
+
 	labels := make(map[string]int64, 2000)
 	items := make([]int64, 0, 5000)
 
@@ -263,6 +283,8 @@ type strRow struct {
 }
 
 func TestEdge_Strings(t *testing.T) {
+	t.Parallel()
+
 	rows := []strRow{
 		{A: "", B: "with\x00null", L: []string{"", "x", "café", "日本語", "emoji😀"}},
 		{A: "café", B: "日本語", L: []string{"line\nbreak", "tab\there"}},
@@ -273,6 +295,8 @@ func TestEdge_Strings(t *testing.T) {
 
 // sanity: reflect.DeepEqual treats -0.0 == 0.0; make the intent explicit.
 func TestEdge_NegZeroDeepEqualSanity(t *testing.T) {
+	t.Parallel()
+
 	if !reflect.DeepEqual(math.Copysign(0, -1), 0.0) {
 		t.Skip("DeepEqual distinguishes -0.0; float special test would need bit compare")
 	}

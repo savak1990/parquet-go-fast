@@ -2,10 +2,8 @@ package parquetfast_test
 
 import (
 	"bytes"
-	"io"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,24 +12,12 @@ import (
 	parquetfast "github.com/savak1990/parquet-go-fast"
 )
 
-// countingAt wraps any io.ReaderAt and counts bytes read — a stand-in for remote
-// storage to show how little a selective query on a sorted file actually fetches.
-type countingAt struct {
-	ra    io.ReaderAt
-	bytes atomic.Int64
-}
-
-func (c *countingAt) ReadAt(p []byte, off int64) (int, error) {
-	n, err := c.ra.ReadAt(p, off)
-	c.bytes.Add(int64(n))
-
-	return n, err
-}
-
 // On a sorted column, page selection is a binary search over the ascending page
 // index. The result must match the linear scan exactly; this checks every
 // operator against a manual filter on a many-page sorted file.
 func TestSorted_BinarySearchCorrectness(t *testing.T) {
+	t.Parallel()
+
 	data := ppFixture(t, 20000) // single row group, many pages, ids ascending
 
 	f, _ := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
@@ -97,6 +83,8 @@ type hugeRow struct {
 }
 
 func TestSorted_HugeFile(t *testing.T) {
+	t.Parallel()
+
 	if os.Getenv("PARQUET_FAST_HUGE") == "" {
 		t.Skip("set PARQUET_FAST_HUGE=1 to run the multi-GB sorted-file test")
 	}
@@ -127,7 +115,7 @@ func TestSorted_HugeFile(t *testing.T) {
 	}
 	defer func() { _ = file.Close() }()
 
-	cr := &countingAt{ra: file}
+	cr := &instrumentedReaderAt{ra: file}
 
 	// A narrow range deep in the file: row-group pruning skips all but one group,
 	// then binary search picks the matching page(s) within it.

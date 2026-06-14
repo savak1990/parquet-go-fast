@@ -3,7 +3,6 @@ package parquetfast_test
 import (
 	"bytes"
 	"reflect"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -76,6 +75,8 @@ func projFixture(t *testing.T, n int) []byte {
 // ── Correctness: each narrow subset matches the full decode ───────────────────
 
 func TestProjection_Scalars(t *testing.T) {
+	t.Parallel()
+
 	type narrow struct {
 		A int64  `parquet:"a"`
 		E string `parquet:"e"`
@@ -97,6 +98,8 @@ func TestProjection_Scalars(t *testing.T) {
 }
 
 func TestProjection_OmitsMapSliceStructTime(t *testing.T) {
+	t.Parallel()
+
 	// A narrow struct that keeps a scalar + the map, dropping slice/struct/time.
 	type narrow struct {
 		A      int64             `parquet:"a"`
@@ -122,6 +125,8 @@ func TestProjection_OmitsMapSliceStructTime(t *testing.T) {
 }
 
 func TestProjection_KeepSliceDropRest(t *testing.T) {
+	t.Parallel()
+
 	type narrow struct {
 		A     int64      `parquet:"a"`
 		Items []projItem `parquet:"items"`
@@ -143,6 +148,8 @@ func TestProjection_KeepSliceDropRest(t *testing.T) {
 }
 
 func TestProjection_KeepOptionalStructDropRest(t *testing.T) {
+	t.Parallel()
+
 	type narrow struct {
 		A     int64      `parquet:"a"`
 		Stats *projStats `parquet:"stats,optional"`
@@ -171,6 +178,8 @@ func TestProjection_KeepOptionalStructDropRest(t *testing.T) {
 }
 
 func TestProjection_KeepTimeDropRest(t *testing.T) {
+	t.Parallel()
+
 	type narrow struct {
 		A    int64     `parquet:"a"`
 		When time.Time `parquet:"when"`
@@ -193,6 +202,8 @@ func TestProjection_KeepTimeDropRest(t *testing.T) {
 
 // Projection must not change results vs reading the full struct.
 func TestProjection_MatchesFullDecodeSubset(t *testing.T) {
+	t.Parallel()
+
 	type narrow struct {
 		A int64  `parquet:"a"`
 		D string `parquet:"d"`
@@ -219,19 +230,9 @@ func TestProjection_MatchesFullDecodeSubset(t *testing.T) {
 
 // ── Proof that projection reads fewer bytes ───────────────────────────────────
 
-type countingReaderAt struct {
-	r     *bytes.Reader
-	bytes atomic.Int64
-}
-
-func (c *countingReaderAt) ReadAt(p []byte, off int64) (int, error) {
-	n, err := c.r.ReadAt(p, off)
-	c.bytes.Add(int64(n))
-
-	return n, err
-}
-
 func TestProjection_ReadsFewerBytes(t *testing.T) {
+	t.Parallel()
+
 	type narrow struct {
 		A int64  `parquet:"a"`
 		E string `parquet:"e"`
@@ -241,7 +242,7 @@ func TestProjection_ReadsFewerBytes(t *testing.T) {
 	size := int64(len(buf))
 
 	read := func(opts ...parquetfast.Option) int64 {
-		cr := &countingReaderAt{r: bytes.NewReader(buf)}
+		cr := newRemoteReaderAt(buf)
 		if _, err := parquetfast.Unmarshal[narrow](cr, size, opts...); err != nil {
 			t.Fatalf("decode: %v", err)
 		}

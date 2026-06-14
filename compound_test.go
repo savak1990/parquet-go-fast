@@ -29,6 +29,8 @@ func init() {
 }
 
 func TestOptionalStruct(t *testing.T) {
+	t.Parallel()
+
 	rows := []optStructRow{
 		{Name: "has", Inner: &optStructInner{A: "x", B: 1}},
 		{Name: "nil", Inner: nil},
@@ -48,6 +50,8 @@ type optStructRow2 struct {
 }
 
 func TestOptionalStructReflectFallback(t *testing.T) {
+	t.Parallel()
+
 	rows := []optStructRow2{
 		{Name: "has", Inner: &optStructInner2{C: "z"}},
 		{Name: "nil"},
@@ -73,6 +77,8 @@ func init() {
 }
 
 func TestStructListRegistered(t *testing.T) {
+	t.Parallel()
+
 	rows := []structListRow{
 		{Name: "one", Items: []listItem{{A: "x", B: 1}, {A: "y", B: 2}}},
 		{Name: "two", Items: []listItem{{A: "z", B: 3}}},
@@ -91,6 +97,8 @@ type structListRow2 struct {
 }
 
 func TestStructListReflectFallback(t *testing.T) {
+	t.Parallel()
+
 	rows := []structListRow2{
 		{Name: "one", Items: []listItem2{{C: "a"}, {C: "b"}}},
 		{Name: "two", Items: []listItem2{{C: "c"}}},
@@ -109,6 +117,8 @@ type primitiveMapRow struct {
 }
 
 func TestPrimitiveMaps(t *testing.T) {
+	t.Parallel()
+
 	rows := []primitiveMapRow{
 		{
 			SS:   map[string]string{"a": "1", "b": "2"},
@@ -146,6 +156,8 @@ func init() {
 }
 
 func TestStructValuedMapRegistered(t *testing.T) {
+	t.Parallel()
+
 	rows := []structMapRow{
 		{Name: "p1", Containers: map[string]containerStats{
 			"app":     {Name: "app", CPU: 100},
@@ -169,6 +181,8 @@ type structMapRow2 struct {
 }
 
 func TestStructValuedMapReflectFallback(t *testing.T) {
+	t.Parallel()
+
 	rows := []structMapRow2{
 		{Name: "a", M: map[string]containerStats2{"k1": {V: 1}, "k2": {V: 2}}},
 		{Name: "b", M: map[string]containerStats2{"k3": {V: 3}}},
@@ -185,6 +199,8 @@ type nestedMapRow struct {
 }
 
 func TestNestedMap(t *testing.T) {
+	t.Parallel()
+
 	rows := []nestedMapRow{
 		{Name: "a", Targets: map[string]map[string]float64{
 			"cpu":    {"util": 0.8, "limit": 1.0},
@@ -207,6 +223,8 @@ type mrgRow struct {
 }
 
 func TestMultiRowGroup(t *testing.T) {
+	t.Parallel()
+
 	const n = 50
 
 	rows := make([]mrgRow, n)
@@ -235,6 +253,8 @@ func TestMultiRowGroup(t *testing.T) {
 // ── Reader[T] streaming ──────────────────────────────────────────────────────
 
 func TestReaderStreaming(t *testing.T) {
+	t.Parallel()
+
 	const n = 37
 
 	rows := make([]scalarRow, n)
