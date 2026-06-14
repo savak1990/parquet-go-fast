@@ -199,8 +199,9 @@ bytes of a full decode and ran ~43× faster — because only the matching pages 
 fetched and decoded. The win scales with how well the data is clustered on the
 filter column.
 
-NULL values never match a value predicate. Filtering currently runs sequentially
-(`WithConcurrency` is ignored when `Where` is set).
+NULL values never match a value predicate. Add `WithConcurrency(n)` to filter
+across workers — each surviving row group is filtered independently and the
+results are concatenated in file order (≈6× faster when many groups survive).
 
 ## Reading from S3 / remote storage
 
@@ -519,8 +520,6 @@ go test -run='^$' -bench='BenchmarkConcurrentDecode|BenchmarkProjection|Benchmar
   empty one for required fields; an unset required `[]byte`/`[]T`/`map` may
   decode as an empty (non-nil) value. Use optional (`*T`, or
   `,optional`-tagged) fields where the distinction matters.
-- **Multi-row-group files** are supported (each group is masked for all-null
-  columns, then combined via `parquet.MultiRowGroup`).
 - **`time.Time`** decodes to the absolute instant in **UTC** (parquet stores an
   epoch value; the column's adjusted-to-UTC flag affects only display). Compare
   decoded times with `.Equal`, not `==`/`reflect.DeepEqual` — Go has multiple

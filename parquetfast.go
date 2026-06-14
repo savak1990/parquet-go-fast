@@ -175,6 +175,10 @@ func decodeFile[T any](f *parquet.File, cfg config) ([]T, error) {
 
 	// Row filtering: prune row groups by statistics, decode + filter the rest.
 	if len(cfg.predicates) > 0 {
+		if workers := cfg.workers(); workers > 1 {
+			return decodeFilteredConcurrent[T](f, cfg, plan, mask, workers)
+		}
+
 		return decodeFiltered[T](f, cfg, plan, mask)
 	}
 
@@ -350,6 +354,144 @@ func decodeFiltered[T any](f *parquet.File, cfg config, plan *Plan, mask []bool)
 	}
 
 	return out[:n], nil
+}
+
+// decodeFilteredConcurrent filters across workers: each surviving row group is
+// filtered independently into its own result slice, then the per-group results
+// are concatenated in file order. Parallelism is per row group, so a single
+// surviving group runs effectively sequentially.
+func decodeFilteredConcurrent[T any](f *parquet.File, cfg config, plan *Plan, mask []bool, workers int) ([]T, error) {
+	fr, err := newFilteredReader(f, cfg, plan, mask)
+	if err != nil {
+		return nil, err
+	}
+
+	groups := fr.groups
+	if len(groups) == 0 {
+		return []T{}, nil
+	}
+
+	results := make([][]T, len(groups))
+	errs := make([]error, len(groups))
+
+	var (
+		next atomic.Int64
+		wg   sync.WaitGroup
+	)
+
+	w := min(workers, len(groups))
+	for k := 0; k < w; k++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= len(groups) {
+					return
+				}
+
+				results[i], errs[i] = filterGroup[T](groups[i], plan, fr.preds, cfg.batchSize)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	total := 0
+
+	for i := range results {
+		if errs[i] != nil {
+			return nil, errs[i]
+		}
+
+		total += len(results[i])
+	}
+
+	// Concatenate per-group results in file order (copies struct headers only).
+	out := make([]T, 0, total)
+	for i := range results {
+		out = append(out, results[i]...)
+	}
+
+	return out, nil
+}
+
+// filterGroup decodes one (masked) row group with page pruning and returns its
+// matching rows in order. Each call uses its own reader and scratch, so groups
+// can be filtered concurrently (the file's io.ReaderAt must allow concurrent
+// ReadAt).
+func filterGroup[T any](rg parquet.RowGroup, plan *Plan, preds []compiledPred, batchSize int) (_ []T, err error) {
+	ranges := candidateRanges(rg, preds)
+	if len(ranges) == 0 {
+		return nil, nil
+	}
+
+	upper := 0
+	for _, rng := range ranges {
+		upper += int(rng[1] - rng[0])
+	}
+
+	out := make([]T, upper)
+
+	rows := rg.Rows()
+
+	defer func() {
+		if cerr := rows.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("close parquet rows: %w", cerr)
+		}
+	}()
+
+	leafVals := make([][]parquet.Value, plan.NumLeaves())
+	batch := make([]parquet.Row, batchSize)
+
+	var zero T
+
+	w := 0
+	pos := int64(0)
+
+	for _, rng := range ranges {
+		if pos < rng[0] {
+			if serr := rows.SeekToRow(rng[0]); serr != nil {
+				return nil, fmt.Errorf("seek to row %d: %w", rng[0], serr)
+			}
+
+			pos = rng[0]
+		}
+
+		for pos < rng[1] {
+			want := batchSize
+			if int64(want) > rng[1]-pos {
+				want = int(rng[1] - pos)
+			}
+
+			n, rerr := rows.ReadRows(batch[:want])
+			for i := 0; i < n; i++ {
+				pos++
+
+				unflattenRow(batch[i], leafVals)
+
+				if matchAll(preds, leafVals) {
+					out[w] = zero
+					plan.applyDecoded(unsafe.Pointer(&out[w]), leafVals)
+					w++
+				}
+			}
+
+			if rerr != nil {
+				if !errors.Is(rerr, io.EOF) {
+					return nil, fmt.Errorf("read parquet rows: %w", rerr)
+				}
+
+				if n == 0 {
+					return out[:w], nil
+				}
+			}
+		}
+	}
+
+	return out[:w], nil
 }
 
 // filteredReader drives predicate-filtered decoding with row-group + page pruning

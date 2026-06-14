@@ -286,4 +286,68 @@ func BenchmarkFilter(b *testing.B) {
 			}
 		}
 	})
+
+	// Keeps ~half the row groups, so concurrency can parallelize the survivors.
+	b.Run("filtered-half-sequential", func(b *testing.B) {
+		b.ReportAllocs()
+
+		for b.Loop() {
+			_, err := parquetfast.UnmarshalBytes[filterRow](data,
+				parquetfast.Where(parquetfast.Col("id").GreaterOrEqual(int64(500_000))))
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("filtered-half-concurrent", func(b *testing.B) {
+		b.ReportAllocs()
+
+		for b.Loop() {
+			_, err := parquetfast.UnmarshalBytes[filterRow](data,
+				parquetfast.Where(parquetfast.Col("id").GreaterOrEqual(int64(500_000))),
+				parquetfast.WithConcurrency(0))
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func TestFilter_ConcurrentMatchesSequential(t *testing.T) {
+	// Multi-row-group file so concurrency parallelizes across groups.
+	rows := make([]filterRow, 4000)
+	for i := range rows {
+		rows[i] = makeFilterRow(i)
+	}
+
+	data := writeGeneric(t, rows, parquet.MaxRowsPerRowGroup(100)) // 40 row groups
+
+	preds := []parquetfast.Predicate{
+		parquetfast.Col("id").Between(int64(250), int64(3750)),
+		parquetfast.Col("region").Equal("eu"),
+	}
+
+	seq, err := parquetfast.UnmarshalBytes[filterRow](data, parquetfast.Where(preds...))
+	if err != nil {
+		t.Fatalf("sequential: %v", err)
+	}
+
+	for _, workers := range []int{2, 4, 0 /* GOMAXPROCS */} {
+		con, err := parquetfast.UnmarshalBytes[filterRow](data,
+			parquetfast.Where(preds...), parquetfast.WithConcurrency(workers))
+		if err != nil {
+			t.Fatalf("concurrent(%d): %v", workers, err)
+		}
+
+		if len(con) != len(seq) {
+			t.Fatalf("concurrent(%d): count %d, want %d", workers, len(con), len(seq))
+		}
+
+		for i := range seq {
+			if con[i] != seq[i] { // file order must be preserved
+				t.Fatalf("concurrent(%d) row %d: got %+v want %+v", workers, i, con[i], seq[i])
+			}
+		}
+	}
 }
