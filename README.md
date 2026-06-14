@@ -239,6 +239,13 @@ bytes of a full decode and ran ~43× faster — because only the matching pages 
 fetched and decoded. The win scales with how well the data is clustered on the
 filter column.
 
+When the filter column is **sorted** (parquet-go marks the page index ascending
+automatically when the data is written in order), page selection uses a binary
+search over the page index instead of scanning every page — O(log pages) rather
+than O(pages), with identical results. On a **2 GiB** sorted file (16.7M rows), a
+range query returning 101 rows read **0.15% of the file (3 MiB) in 3 ms** — only
+the footer, the surviving row group's page index, and the matching page.
+
 NULL values never match a value predicate. Add `WithConcurrency(n)` to filter
 across workers — each surviving row group is filtered independently and the
 results are concatenated in file order (≈6× faster when many groups survive).

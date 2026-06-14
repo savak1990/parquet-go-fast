@@ -494,6 +494,15 @@ func (cp *compiledPredicate) pageRanges(rg parquet.RowGroup, groupRows int64) ([
 		return nil, false
 	}
 
+	// Fast path: when the column's pages are ascending (parquet-go sets this
+	// whenever the data was written sorted), binary-search the contiguous
+	// matching page window in O(log pages) instead of scanning every page.
+	if ci.IsAscending() {
+		if rs, ok := cp.ascendingPageRanges(ci, oi, np, groupRows); ok {
+			return rs, true
+		}
+	}
+
 	ranges := make([][2]int64, 0, np)
 
 	for p := 0; p < np; p++ {
@@ -512,6 +521,65 @@ func (cp *compiledPredicate) pageRanges(rg parquet.RowGroup, groupRows int64) ([
 	}
 
 	return mergeRanges(ranges), true
+}
+
+// ascendingPageRanges returns the single contiguous row range covering the pages
+// that can match, found by binary search over the ascending per-page min/max.
+// ok is false for operators that aren't a single interval (NotEqual), which fall
+// back to the linear page scan. The result is identical to the linear scan — only
+// the page-selection cost drops from O(pages) to O(log pages).
+func (cp *compiledPredicate) ascendingPageRanges(ci parquet.ColumnIndex, oi parquet.OffsetIndex, np int, groupRows int64) ([][2]int64, bool) {
+	maxGE := func(target parquet.Value, strict bool) int { // first page whose max >= / > target
+		return sort.Search(np, func(p int) bool {
+			c := cp.typ.Compare(ci.MaxValue(p), target)
+			if strict {
+				return c > 0
+			}
+
+			return c >= 0
+		})
+	}
+
+	minGT := func(target parquet.Value, strict bool) int { // first page whose min > / >= target
+		return sort.Search(np, func(p int) bool {
+			c := cp.typ.Compare(ci.MinValue(p), target)
+			if strict {
+				return c >= 0
+			}
+
+			return c > 0
+		})
+	}
+
+	var lo, hi int // [lo, hi) page window
+
+	switch cp.op {
+	case opEq:
+		lo, hi = maxGE(cp.lo, false), minGT(cp.lo, false)
+	case opGe:
+		lo, hi = maxGE(cp.lo, false), np
+	case opGt:
+		lo, hi = maxGE(cp.lo, true), np
+	case opLe:
+		lo, hi = 0, minGT(cp.lo, false)
+	case opLt:
+		lo, hi = 0, minGT(cp.lo, true)
+	case opBetween:
+		lo, hi = maxGE(cp.lo, false), minGT(cp.hi, false)
+	default: // opNe is not a single interval
+		return nil, false
+	}
+
+	if lo >= hi {
+		return nil, true // no matching pages
+	}
+
+	end := groupRows
+	if hi < np {
+		end = oi.FirstRowIndex(hi)
+	}
+
+	return [][2]int64{{oi.FirstRowIndex(lo), end}}, true
 }
 
 // mergeRanges merges adjacent/overlapping ranges (input ordered by start).
