@@ -334,12 +334,18 @@ What this says:
 - **Allocation count is equal-to-much-lower** — about the same on flat/nested
   shapes (both decoders pay the same string/`[]byte` content copies), and
   sharply lower on map-heavy (−20% to −50%) and `time.Time`-heavy (−80%) shapes.
-- **Memory bytes are mixed.** Lower on scalar and `time.Time` shapes (the time
-  fast path is a big win: −66% bytes / −80% allocs), but **higher on map-heavy
-  shapes** (up to +64%): parquet-go-fast builds a fresh typed map per row, which
-  can allocate more total bytes than `GenericReader`'s reflection path even
-  though it makes fewer allocation *calls*. If steady-state memory on
-  map-dense data is your priority, measure before adopting.
+- **Memory bytes are mixed *in the streaming matrix above*.** Lower on scalar
+  and `time.Time` shapes (the time fast path is a big win: −66% bytes / −80%
+  allocs), but higher on map-heavy shapes (up to +64%). The reason is specific:
+  when streaming into a **reused** buffer, `GenericReader` reuses the existing
+  map's storage in each reused slot (it only allocates a map when the slot is
+  nil), whereas parquet-go-fast zeroes each slot first (to avoid leaking a prior
+  row's data) and so `make`s a fresh map per row. That's extra GC *churn* (total
+  bytes allocated), **not** higher peak/live memory — peak stays bounded by the
+  batch for both. It also **only affects the streaming `Reader`**: with
+  `UnmarshalBytes`/`UnmarshalFile` every destination slot is fresh, neither
+  reader can reuse, and parquet-go-fast wins on bytes too (see below). So for the
+  common materialize-all case, memory is strictly lower.
 
 The `time.Time` row is the standout: parquet-go decodes each timestamp through
 reflection (≈817k allocs here), while parquet-go-fast reconstructs it with a
@@ -366,11 +372,33 @@ shapes" caveat does not apply here, because `GenericReader`'s materialize path i
 much heavier per row. Concurrency adds a further 3.8× (−87% / 7.6× vs
 `GenericReader`) on this 10-row-group file.
 
+### The production sweet spot: sparse, wide, map-heavy records
+
+The biggest wins are on records shaped like real telemetry/analytics rollups:
+many columns, a high-cardinality `map[string]Struct`, `[]byte` histogram blobs,
+and a **long tail of optional columns that are entirely null per file** (features
+most rows don't use), including null sub-structs *inside* the map. 200k such
+records, 47 leaf columns, 4 row groups, Apple M4 Pro:
+
+| API | time | bytes | allocs |
+|---|---:|---:|---:|
+| `parquet-go` `GenericReader` (materialize) | 2052 ms | 4895 MB | 33.0 M |
+| **`UnmarshalBytes`** | **770 ms** | **1711 MB** | **18.8 M** |
+| **`UnmarshalBytes` + `WithConcurrency(0)`** | **275 ms** | 1720 MB | 18.8 M |
+
+That's **−62% time, −65% bytes, −43% allocs** vs `GenericReader`, and **7.5×
+(−87%)** with concurrency. The reflection reader pays to decode the all-null tail
+*per map entry* (8×/row here); parquet-go-fast never allocates for it, and its
+null-column elision also skips those pages outright (~15% of the time saving).
+This mirrors what the same approach achieves on production data
+(`pqtWorkload`-style files): −67% time / −85% bytes / −47% allocs vs the
+reflection reader.
+
 Reproduce:
 
 ```sh
 go test -run='^$' -bench='BenchmarkShape' -benchmem -benchtime=10x
-go test -run='^$' -bench='BenchmarkLargeUnmarshal' -benchmem -benchtime=5x
+go test -run='^$' -bench='BenchmarkLargeUnmarshal|BenchmarkSparseWide' -benchmem -benchtime=5x
 go test -run='^$' -bench='BenchmarkConcurrentDecode|BenchmarkProjection|BenchmarkPlanApply' -benchmem
 ```
 
