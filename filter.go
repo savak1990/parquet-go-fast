@@ -2,6 +2,7 @@ package parquetfast
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -10,14 +11,16 @@ import (
 
 // Row filtering with predicate pushdown.
 //
-// Build a predicate with Col(...) and pass it via Where(...). Decoding then:
+// Build predicates with Col(...) and compose them with And/Or; pass the result
+// via Where(...). Decoding then:
 //   - prunes whole row groups whose column statistics (min/max, null count) or
 //     bloom filter prove they cannot match — those pages are never fetched,
 //     decompressed, or decoded;
-//   - decodes the surviving row groups and returns only the rows that match all
-//     predicates.
+//   - prunes individual pages within a surviving group via the page index, and
+//     seeks past the rest;
+//   - returns only the rows that match.
 //
-// The predicate column does not need to be a field of the destination type — you
+// A predicate column does not need to be a field of the destination type — you
 // can filter on a column you don't decode.
 
 type predOp uint8
@@ -31,94 +34,251 @@ const (
 	opBetween
 )
 
-// Predicate is a single-column row filter. Build it via Col(...).
+type predKind uint8
+
+const (
+	predLeaf predKind = iota
+	predAnd
+	predOr
+)
+
+// Predicate is a row filter: a leaf column comparison (built with Col(...)) or a
+// boolean combination (And/Or) of predicates.
 type Predicate struct {
+	kind predKind
+
+	// leaf
 	path []string
 	op   predOp
 	lo   any
 	hi   any // opBetween only
+
+	// composite
+	children []Predicate
 }
 
-// ColRef references a column by its parquet path, for building predicates.
+// ColRef references a column by its parquet path, for building leaf predicates.
 type ColRef struct{ path []string }
 
 // Col references a column by parquet path: Col("region") or Col("a", "b") for a
 // nested field.
 func Col(path ...string) ColRef { return ColRef{path: append([]string(nil), path...)} }
 
+func (c ColRef) leaf(op predOp, lo, hi any) Predicate {
+	return Predicate{kind: predLeaf, path: c.path, op: op, lo: lo, hi: hi}
+}
+
 // Equal matches rows where the column equals v.
-func (c ColRef) Equal(v any) Predicate { return Predicate{c.path, opEq, v, nil} }
+func (c ColRef) Equal(v any) Predicate { return c.leaf(opEq, v, nil) }
 
 // Less matches rows where the column is < v.
-func (c ColRef) Less(v any) Predicate { return Predicate{c.path, opLt, v, nil} }
+func (c ColRef) Less(v any) Predicate { return c.leaf(opLt, v, nil) }
 
 // LessOrEqual matches rows where the column is <= v.
-func (c ColRef) LessOrEqual(v any) Predicate { return Predicate{c.path, opLe, v, nil} }
+func (c ColRef) LessOrEqual(v any) Predicate { return c.leaf(opLe, v, nil) }
 
 // Greater matches rows where the column is > v.
-func (c ColRef) Greater(v any) Predicate { return Predicate{c.path, opGt, v, nil} }
+func (c ColRef) Greater(v any) Predicate { return c.leaf(opGt, v, nil) }
 
 // GreaterOrEqual matches rows where the column is >= v.
-func (c ColRef) GreaterOrEqual(v any) Predicate { return Predicate{c.path, opGe, v, nil} }
+func (c ColRef) GreaterOrEqual(v any) Predicate { return c.leaf(opGe, v, nil) }
 
 // Between matches rows where lo <= column <= hi (inclusive).
-func (c ColRef) Between(lo, hi any) Predicate { return Predicate{c.path, opBetween, lo, hi} }
+func (c ColRef) Between(lo, hi any) Predicate { return c.leaf(opBetween, lo, hi) }
 
-// Where keeps only rows matching ALL given predicates. Row groups that cannot
-// match are skipped without reading their pages. Combine with the usual options.
-//
-// Filtering currently runs sequentially (WithConcurrency is ignored when Where
-// is set). NULL column values never match a value predicate.
+// And matches rows satisfying all of preds. Nestable with Or.
+func And(preds ...Predicate) Predicate { return Predicate{kind: predAnd, children: preds} }
+
+// Or matches rows satisfying any of preds. Nestable with And.
+func Or(preds ...Predicate) Predicate { return Predicate{kind: predOr, children: preds} }
+
+// Where keeps only rows matching the given predicates (multiple are ANDed; use
+// And/Or to nest). Row groups and pages that cannot match are skipped without
+// reading their data. Add WithConcurrency(n) to filter row groups in parallel.
+// NULL column values never match a value predicate.
 func Where(preds ...Predicate) Option {
 	return func(c *config) { c.predicates = append(c.predicates, preds...) }
 }
 
-// compiledPred is a predicate resolved against a concrete file schema.
-type compiledPred struct {
+// compiledPredicate is a predicate tree resolved against a concrete file schema.
+type compiledPredicate struct {
+	kind predKind
+
+	// leaf
 	col int
 	typ parquet.Type
 	op  predOp
 	lo  parquet.Value
 	hi  parquet.Value
+
+	// composite
+	children []compiledPredicate
 }
 
-func compilePredicates(schema *parquet.Schema, preds []Predicate) ([]compiledPred, error) {
-	out := make([]compiledPred, 0, len(preds))
-
-	for _, p := range preds {
-		leaf, ok := schema.Lookup(p.path...)
-		if !ok {
-			return nil, fmt.Errorf("parquet-go-fast: filter column %q not found in schema", strings.Join(p.path, "."))
-		}
-
-		typ := leaf.Node.Type()
-
-		lo, err := toValue(typ, p.lo)
-		if err != nil {
-			return nil, fmt.Errorf("parquet-go-fast: filter on %q: %w", strings.Join(p.path, "."), err)
-		}
-
-		cp := compiledPred{col: leaf.ColumnIndex, typ: typ, op: p.op, lo: lo}
-
-		if p.op == opBetween {
-			hi, err := toValue(typ, p.hi)
-			if err != nil {
-				return nil, fmt.Errorf("parquet-go-fast: filter on %q: %w", strings.Join(p.path, "."), err)
-			}
-
-			cp.hi = hi
-		}
-
-		out = append(out, cp)
+// compileRoot compiles the top-level predicate list (ANDed) into one tree.
+func compileRoot(schema *parquet.Schema, preds []Predicate) (compiledPredicate, error) {
+	if len(preds) == 1 {
+		return compilePredicate(schema, preds[0])
 	}
 
-	return out, nil
+	return compilePredicate(schema, Predicate{kind: predAnd, children: preds})
 }
 
-// keepRowGroup reports whether rg might contain a matching row, using column
-// statistics (min/max, null count) and — for equality — the bloom filter.
-// Returns true (keep) whenever it can't prove the group can't match.
-func (cp compiledPred) keepRowGroup(rg parquet.RowGroup) bool {
+func compilePredicate(schema *parquet.Schema, p Predicate) (compiledPredicate, error) {
+	if p.kind != predLeaf {
+		children := make([]compiledPredicate, len(p.children))
+
+		for i, c := range p.children {
+			cc, err := compilePredicate(schema, c)
+			if err != nil {
+				return compiledPredicate{}, err
+			}
+
+			children[i] = cc
+		}
+
+		return compiledPredicate{kind: p.kind, children: children}, nil
+	}
+
+	leaf, ok := schema.Lookup(p.path...)
+	if !ok {
+		return compiledPredicate{}, fmt.Errorf("parquet-go-fast: filter column %q not found in schema", strings.Join(p.path, "."))
+	}
+
+	typ := leaf.Node.Type()
+
+	lo, err := toValue(typ, p.lo)
+	if err != nil {
+		return compiledPredicate{}, fmt.Errorf("parquet-go-fast: filter on %q: %w", strings.Join(p.path, "."), err)
+	}
+
+	cp := compiledPredicate{kind: predLeaf, col: leaf.ColumnIndex, typ: typ, op: p.op, lo: lo}
+
+	if p.op == opBetween {
+		hi, err := toValue(typ, p.hi)
+		if err != nil {
+			return compiledPredicate{}, fmt.Errorf("parquet-go-fast: filter on %q: %w", strings.Join(p.path, "."), err)
+		}
+
+		cp.hi = hi
+	}
+
+	return cp, nil
+}
+
+// leafCols appends every leaf column referenced by the tree.
+func (cp *compiledPredicate) leafCols(out []int) []int {
+	if cp.kind == predLeaf {
+		return append(out, cp.col)
+	}
+
+	for i := range cp.children {
+		out = cp.children[i].leafCols(out)
+	}
+
+	return out
+}
+
+// keepRowGroup reports whether rg might contain a row matching the tree.
+// AND keeps only if every child keeps; OR keeps if any child keeps.
+func (cp *compiledPredicate) keepRowGroup(rg parquet.RowGroup) bool {
+	switch cp.kind {
+	case predAnd:
+		for i := range cp.children {
+			if !cp.children[i].keepRowGroup(rg) {
+				return false
+			}
+		}
+
+		return true
+	case predOr:
+		for i := range cp.children {
+			if cp.children[i].keepRowGroup(rg) {
+				return true
+			}
+		}
+
+		return false
+	default:
+		return cp.leafKeepRowGroup(rg)
+	}
+}
+
+// matchNode evaluates the tree against one row's per-column values.
+func (cp *compiledPredicate) matchNode(leafVals [][]parquet.Value) bool {
+	switch cp.kind {
+	case predAnd:
+		for i := range cp.children {
+			if !cp.children[i].matchNode(leafVals) {
+				return false
+			}
+		}
+
+		return true
+	case predOr:
+		for i := range cp.children {
+			if cp.children[i].matchNode(leafVals) {
+				return true
+			}
+		}
+
+		return false
+	default:
+		if cp.col < 0 || cp.col >= len(leafVals) {
+			return false
+		}
+
+		vs := leafVals[cp.col]
+		if len(vs) == 0 {
+			return false
+		}
+
+		return cp.matchRow(vs[0])
+	}
+}
+
+// rangesFor returns the group-local row ranges that could contain a matching
+// row. AND intersects children's ranges; OR unions them; a leaf with no page
+// index contributes the whole group (no narrowing).
+func (cp *compiledPredicate) rangesFor(rg parquet.RowGroup, groupRows int64) [][2]int64 {
+	switch cp.kind {
+	case predAnd:
+		cur := [][2]int64{{0, groupRows}}
+
+		for i := range cp.children {
+			cur = intersectRanges(cur, cp.children[i].rangesFor(rg, groupRows))
+			if len(cur) == 0 {
+				return cur
+			}
+		}
+
+		return cur
+	case predOr:
+		var cur [][2]int64
+
+		for i := range cp.children {
+			cur = unionRanges(cur, cp.children[i].rangesFor(rg, groupRows))
+		}
+
+		return cur
+	default:
+		if pr, ok := cp.pageRanges(rg, groupRows); ok {
+			return pr
+		}
+
+		return [][2]int64{{0, groupRows}}
+	}
+}
+
+// candidateRanges returns the group-local row ranges that could contain a row
+// matching the predicate tree.
+func candidateRanges(rg parquet.RowGroup, root *compiledPredicate) [][2]int64 {
+	return root.rangesFor(rg, rg.NumRows())
+}
+
+// leafKeepRowGroup is the leaf-level row-group test using column statistics
+// (min/max, null count) and — for equality — the bloom filter.
+func (cp *compiledPredicate) leafKeepRowGroup(rg parquet.RowGroup) bool {
 	chunks := rg.ColumnChunks()
 	if cp.col >= len(chunks) {
 		return true
@@ -169,7 +329,7 @@ func (cp compiledPred) keepRowGroup(rg parquet.RowGroup) bool {
 	return true
 }
 
-func (cp compiledPred) bloomKeep(chunk parquet.ColumnChunk) bool {
+func (cp *compiledPredicate) bloomKeep(chunk parquet.ColumnChunk) bool {
 	bf := chunk.BloomFilter()
 	if bf == nil {
 		return true
@@ -183,9 +343,9 @@ func (cp compiledPred) bloomKeep(chunk parquet.ColumnChunk) bool {
 	return present
 }
 
-// pageCanMatch reports whether page p of the predicate's column might contain a
+// pageCanMatch reports whether page p of the leaf's column might contain a
 // matching value, using the page index's per-page min/max and null flag.
-func (cp compiledPred) pageCanMatch(ci parquet.ColumnIndex, p int) bool {
+func (cp *compiledPredicate) pageCanMatch(ci parquet.ColumnIndex, p int) bool {
 	if ci.NullPage(p) {
 		return false // all-null page can't satisfy a value predicate
 	}
@@ -211,11 +371,9 @@ func (cp compiledPred) pageCanMatch(ci parquet.ColumnIndex, p int) bool {
 	return true
 }
 
-// pageRanges returns the group-local row ranges [start,end) of pages in the
-// predicate's column that might match, using the column's page index. The second
-// result is false when no page index is available (so no page-level narrowing is
-// possible and the caller should not narrow on this predicate).
-func (cp compiledPred) pageRanges(rg parquet.RowGroup, groupRows int64) ([][2]int64, bool) {
+// pageRanges returns the group-local row ranges of pages in the leaf's column
+// that might match. ok is false when no page index is available.
+func (cp *compiledPredicate) pageRanges(rg parquet.RowGroup, groupRows int64) ([][2]int64, bool) {
 	chunks := rg.ColumnChunks()
 	if cp.col < 0 || cp.col >= len(chunks) {
 		return nil, false
@@ -259,28 +417,6 @@ func (cp compiledPred) pageRanges(rg parquet.RowGroup, groupRows int64) ([][2]in
 	}
 
 	return mergeRanges(ranges), true
-}
-
-// candidateRanges returns the group-local row ranges that could contain a row
-// matching ALL predicates, intersecting each predicate's surviving page ranges.
-// Predicates whose column has no page index contribute no narrowing.
-func candidateRanges(rg parquet.RowGroup, preds []compiledPred) [][2]int64 {
-	groupRows := rg.NumRows()
-	cur := [][2]int64{{0, groupRows}}
-
-	for i := range preds {
-		pr, ok := preds[i].pageRanges(rg, groupRows)
-		if !ok {
-			continue
-		}
-
-		cur = intersectRanges(cur, pr)
-		if len(cur) == 0 {
-			return cur
-		}
-	}
-
-	return cur
 }
 
 // mergeRanges merges adjacent/overlapping ranges (input ordered by start).
@@ -329,8 +465,26 @@ func intersectRanges(a, b [][2]int64) [][2]int64 {
 	return out
 }
 
-// matchRow reports whether a single (non-null) row value satisfies the predicate.
-func (cp compiledPred) matchRow(v parquet.Value) bool {
+// unionRanges returns the sorted, coalesced union of two range lists.
+func unionRanges(a, b [][2]int64) [][2]int64 {
+	if len(a) == 0 {
+		return b
+	}
+
+	if len(b) == 0 {
+		return a
+	}
+
+	merged := make([][2]int64, 0, len(a)+len(b))
+	merged = append(merged, a...)
+	merged = append(merged, b...)
+	sort.Slice(merged, func(i, j int) bool { return merged[i][0] < merged[j][0] })
+
+	return mergeRanges(merged)
+}
+
+// matchRow reports whether a single (non-null) row value satisfies the leaf.
+func (cp *compiledPredicate) matchRow(v parquet.Value) bool {
 	if v.IsNull() {
 		return false
 	}

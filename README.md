@@ -159,12 +159,29 @@ rows, err := parquetfast.UnmarshalFile[Event]("events.parquet",
 )
 ```
 
-Build predicates with `Col(path...)` and one of `Equal`, `Less`, `LessOrEqual`,
-`Greater`, `GreaterOrEqual`, `Between`. Multiple predicates in one `Where` are
-ANDed. Supported value types: bool, all int/uint widths, float32/64, string,
-`[]byte`, and `time.Time` (against TIMESTAMP/DATE columns). The filter column
-**need not be a field of your struct** — you can filter on a column you don't
-decode.
+Build leaf predicates with `Col(path...)` and one of `Equal`, `Less`,
+`LessOrEqual`, `Greater`, `GreaterOrEqual`, `Between`, and combine them with
+`And` / `Or` (nestable). Multiple predicates in one `Where` are ANDed. Supported
+value types: bool, all int/uint widths, float32/64, string, `[]byte`, and
+`time.Time` (against TIMESTAMP/DATE columns). The filter column **need not be a
+field of your struct** — you can filter on a column you don't decode.
+
+```go
+// region == "eu" AND (status == "error" OR latency_ms > 1000)
+rows, err := parquetfast.UnmarshalFile[Event]("events.parquet",
+    parquetfast.Where(
+        parquetfast.Col("region").Equal("eu"),
+        parquetfast.Or(
+            parquetfast.Col("status").Equal("error"),
+            parquetfast.Col("latency_ms").Greater(int64(1000)),
+        ),
+    ),
+)
+```
+
+Pruning recurses through the tree: an `And` keeps a row group/page only if every
+child can match; an `Or` keeps it if any child can (and unions their surviving
+page ranges).
 
 How it works (coarse to fine):
 - **Row-group pruning** — before reading any pages, each group's min/max and null

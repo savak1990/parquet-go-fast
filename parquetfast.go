@@ -392,7 +392,7 @@ func decodeFilteredConcurrent[T any](f *parquet.File, cfg config, plan *Plan, ma
 					return
 				}
 
-				results[i], errs[i] = filterGroup[T](groups[i], plan, fr.preds, cfg.batchSize)
+				results[i], errs[i] = filterGroup[T](groups[i], plan, &fr.root, cfg.batchSize)
 			}
 		}()
 	}
@@ -422,8 +422,8 @@ func decodeFilteredConcurrent[T any](f *parquet.File, cfg config, plan *Plan, ma
 // matching rows in order. Each call uses its own reader and scratch, so groups
 // can be filtered concurrently (the file's io.ReaderAt must allow concurrent
 // ReadAt).
-func filterGroup[T any](rg parquet.RowGroup, plan *Plan, preds []compiledPred, batchSize int) (_ []T, err error) {
-	ranges := candidateRanges(rg, preds)
+func filterGroup[T any](rg parquet.RowGroup, plan *Plan, root *compiledPredicate, batchSize int) (_ []T, err error) {
+	ranges := candidateRanges(rg, root)
 	if len(ranges) == 0 {
 		return nil, nil
 	}
@@ -472,7 +472,7 @@ func filterGroup[T any](rg parquet.RowGroup, plan *Plan, preds []compiledPred, b
 
 				unflattenRow(batch[i], leafVals)
 
-				if matchAll(preds, leafVals) {
+				if root.matchNode(leafVals) {
 					out[w] = zero
 					plan.applyDecoded(unsafe.Pointer(&out[w]), leafVals)
 					w++
@@ -499,7 +499,7 @@ func filterGroup[T any](rg parquet.RowGroup, plan *Plan, preds []compiledPred, b
 // streaming Reader. Not safe for concurrent use.
 type filteredReader struct {
 	groups   []parquet.RowGroup // row-group-pruned, masked
-	preds    []compiledPred
+	root     compiledPredicate
 	plan     *Plan
 	leafVals [][]parquet.Value
 	batch    []parquet.Row
@@ -514,7 +514,7 @@ type filteredReader struct {
 // newFilteredReader compiles predicates, prunes row groups by statistics/bloom,
 // and masks each surviving group (forcing predicate columns to be read).
 func newFilteredReader(f *parquet.File, cfg config, plan *Plan, mask []bool) (*filteredReader, error) {
-	preds, err := compilePredicates(f.Schema(), cfg.predicates)
+	root, err := compileRoot(f.Schema(), cfg.predicates)
 	if err != nil {
 		return nil, err
 	}
@@ -522,9 +522,9 @@ func newFilteredReader(f *parquet.File, cfg config, plan *Plan, mask []bool) (*f
 	// Predicate columns must be read even if the destination type omits them.
 	if mask != nil {
 		m := append([]bool(nil), mask...)
-		for _, p := range preds {
-			if p.col >= 0 && p.col < len(m) {
-				m[p.col] = false
+		for _, c := range root.leafCols(nil) {
+			if c >= 0 && c < len(m) {
+				m[c] = false
 			}
 		}
 
@@ -535,7 +535,7 @@ func newFilteredReader(f *parquet.File, cfg config, plan *Plan, mask []bool) (*f
 	groups := make([]parquet.RowGroup, 0, len(rgs))
 
 	for _, rg := range rgs {
-		if keepRowGroup(preds, rg) {
+		if root.keepRowGroup(rg) {
 			groups = append(groups, NewMaskedRowGroup(rg, mask))
 		}
 	}
@@ -547,7 +547,7 @@ func newFilteredReader(f *parquet.File, cfg config, plan *Plan, mask []bool) (*f
 
 	return &filteredReader{
 		groups:   groups,
-		preds:    preds,
+		root:     root,
 		plan:     plan,
 		leafVals: make([][]parquet.Value, plan.NumLeaves()),
 		batch:    make([]parquet.Row, batchSize),
@@ -581,7 +581,7 @@ func filteredRead[T any](fr *filteredReader, dst []T) (int, error) {
 
 			rg := fr.groups[fr.gi]
 			fr.rows = rg.Rows()
-			fr.ranges = candidateRanges(rg, fr.preds)
+			fr.ranges = candidateRanges(rg, &fr.root)
 			fr.ri = 0
 			fr.pos = 0
 		}
@@ -633,7 +633,7 @@ func filteredRead[T any](fr *filteredReader, dst []T) (int, error) {
 
 			unflattenRow(fr.batch[i], fr.leafVals)
 
-			if matchAll(fr.preds, fr.leafVals) {
+			if fr.root.matchNode(fr.leafVals) {
 				dst[w] = zero // reset (dst may be a reused streaming buffer)
 				fr.plan.applyDecoded(unsafe.Pointer(&dst[w]), fr.leafVals)
 				w++
@@ -656,36 +656,6 @@ func filteredRead[T any](fr *filteredReader, dst []T) (int, error) {
 	}
 
 	return w, nil
-}
-
-// keepRowGroup reports whether rg survives all predicates (AND).
-func keepRowGroup(preds []compiledPred, rg parquet.RowGroup) bool {
-	for i := range preds {
-		if !preds[i].keepRowGroup(rg) {
-			return false
-		}
-	}
-
-	return true
-}
-
-// matchAll reports whether the row's values satisfy every predicate. A predicate
-// column with no value for the row (or a null) never matches.
-func matchAll(preds []compiledPred, leafVals [][]parquet.Value) bool {
-	for i := range preds {
-		p := &preds[i]
-
-		if p.col < 0 || p.col >= len(leafVals) {
-			return false
-		}
-
-		vs := leafVals[p.col]
-		if len(vs) == 0 || !p.matchRow(vs[0]) {
-			return false
-		}
-	}
-
-	return true
 }
 
 // decodeAllRows pulls rows in batches and applies plan to each, writing in place

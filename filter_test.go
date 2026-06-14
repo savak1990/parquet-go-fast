@@ -351,3 +351,82 @@ func TestFilter_ConcurrentMatchesSequential(t *testing.T) {
 		}
 	}
 }
+
+func TestFilter_Or(t *testing.T) {
+	data := filterFixture(t, 300, 50)
+
+	assertFilter(t, data, func(r filterRow) bool { return r.ID < 10 || r.ID > 290 },
+		parquetfast.Or(
+			parquetfast.Col("id").Less(int64(10)),
+			parquetfast.Col("id").Greater(int64(290)),
+		))
+
+	// OR across different columns.
+	assertFilter(t, data, func(r filterRow) bool { return r.Region == "eu" || r.ID < 5 },
+		parquetfast.Or(
+			parquetfast.Col("region").Equal("eu"),
+			parquetfast.Col("id").Less(int64(5)),
+		))
+}
+
+func TestFilter_NestedAndOr(t *testing.T) {
+	data := filterFixture(t, 300, 50)
+
+	// region == "eu" AND (id < 50 OR id > 250)
+	assertFilter(t, data,
+		func(r filterRow) bool { return r.Region == "eu" && (r.ID < 50 || r.ID > 250) },
+		parquetfast.And(
+			parquetfast.Col("region").Equal("eu"),
+			parquetfast.Or(
+				parquetfast.Col("id").Less(int64(50)),
+				parquetfast.Col("id").Greater(int64(250)),
+			),
+		))
+}
+
+func TestFilter_OrPrunesRowGroups(t *testing.T) {
+	data := filterFixture(t, 2000, 100) // 20 row groups, ids [g*100,(g+1)*100)
+
+	f, _ := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
+	cc := f.RowGroups()[0].ColumnChunks()[0].(*parquet.FileColumnChunk)
+	if _, _, ok := cc.Bounds(); !ok {
+		t.Skip("no column statistics")
+	}
+
+	read := func(opts ...parquetfast.Option) int64 {
+		cr := &countingReaderAt{r: bytes.NewReader(data)}
+		if _, err := parquetfast.Unmarshal[filterRow](cr, int64(len(data)), opts...); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+
+		return cr.bytes.Load()
+	}
+
+	// Matches only group 1 (100..200) or group 18 (1800..1900): 18/20 pruned.
+	or := parquetfast.Where(parquetfast.Or(
+		parquetfast.Col("id").Between(int64(150), int64(160)),
+		parquetfast.Col("id").Between(int64(1850), int64(1860)),
+	))
+
+	full := read()
+	filtered := read(or)
+
+	t.Logf("OR pruning bytes: full=%d, filtered=%d (%.1f%%)", full, filtered, 100*float64(filtered)/float64(full))
+
+	if filtered >= full {
+		t.Fatalf("OR should prune row groups: %d >= %d", filtered, full)
+	}
+
+	got, _ := parquetfast.UnmarshalBytes[filterRow](data, or)
+	if len(got) != 22 {
+		t.Fatalf("expected 22 rows, got %d", len(got))
+	}
+
+	for _, r := range got {
+		in1 := r.ID >= 150 && r.ID <= 160
+		in2 := r.ID >= 1850 && r.ID <= 1860
+		if !in1 && !in2 {
+			t.Fatalf("row out of OR range: %d", r.ID)
+		}
+	}
+}
