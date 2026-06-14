@@ -516,3 +516,63 @@ func TestFilter_NotEqualPrunesConstantGroup(t *testing.T) {
 		}
 	}
 }
+
+func TestFilter_In(t *testing.T) {
+	data := filterFixture(t, 300, 50)
+
+	// String set.
+	assertFilter(t, data, func(r filterRow) bool { return r.Region == "us" || r.Region == "apac" },
+		parquetfast.Col("region").In("us", "apac"))
+
+	// Int set.
+	assertFilter(t, data, func(r filterRow) bool { return r.ID == 1 || r.ID == 50 || r.ID == 299 },
+		parquetfast.Col("id").In(int64(1), int64(50), int64(299)))
+
+	// Empty In matches nothing.
+	assertFilter(t, data, func(r filterRow) bool { return false },
+		parquetfast.Col("id").In())
+
+	// Not(In) = none of the values (De Morgan → And of NotEquals).
+	assertFilter(t, data, func(r filterRow) bool { return r.Region != "us" && r.Region != "eu" },
+		parquetfast.Not(parquetfast.Col("region").In("us", "eu")))
+}
+
+func TestFilter_InPrunesRowGroups(t *testing.T) {
+	data := filterFixture(t, 2000, 100) // 20 groups, ids [g*100,(g+1)*100)
+
+	f, _ := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
+	if _, _, ok := f.RowGroups()[0].ColumnChunks()[0].(*parquet.FileColumnChunk).Bounds(); !ok {
+		t.Skip("no stats")
+	}
+
+	read := func(opts ...parquetfast.Option) int64 {
+		cr := &countingReaderAt{r: bytes.NewReader(data)}
+		if _, err := parquetfast.Unmarshal[filterRow](cr, int64(len(data)), opts...); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return cr.bytes.Load()
+	}
+
+	// Values land in group 1 (150) and group 17 (1750): 18/20 groups pruned.
+	in := parquetfast.Where(parquetfast.Col("id").In(int64(150), int64(1750)))
+
+	full := read()
+	filtered := read(in)
+
+	t.Logf("In pruning bytes: full=%d, filtered=%d (%.1f%%)", full, filtered, 100*float64(filtered)/float64(full))
+
+	if filtered >= full {
+		t.Fatalf("In should prune row groups: %d >= %d", filtered, full)
+	}
+
+	got, _ := parquetfast.UnmarshalBytes[filterRow](data, in)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(got))
+	}
+
+	for _, r := range got {
+		if r.ID != 150 && r.ID != 1750 {
+			t.Fatalf("unexpected id %d", r.ID)
+		}
+	}
+}

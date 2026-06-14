@@ -160,7 +160,7 @@ rows, err := parquetfast.UnmarshalFile[Event]("events.parquet",
 ```
 
 Build leaf predicates with `Col(path...)` and one of `Equal`, `NotEqual`, `Less`,
-`LessOrEqual`, `Greater`, `GreaterOrEqual`, `Between`, and combine them with
+`LessOrEqual`, `Greater`, `GreaterOrEqual`, `Between`, `In`, and combine them with
 `And` / `Or` / `Not` (nestable). Multiple predicates in one `Where` are ANDed.
 Supported value types: bool, all int/uint widths, float32/64, string, `[]byte`,
 and `time.Time` (against TIMESTAMP/DATE columns). The filter column **need not be
@@ -181,6 +181,13 @@ parquetfast.Where(
 leaves (De Morgan: `!(a AND b)` → `!a OR !b`, `!(x == v)` → `x != v`,
 `!Between` → `< lo OR > hi`), so pruning still applies. As in SQL, NULL never
 matches a value predicate (so `NotEqual`/`Not` exclude NULL rows).
+
+`In(...)` is an Or of equality checks, so it prunes per value (statistics +
+bloom) and composes with `Not` (`Not(Col("x").In(a, b))` → `x != a AND x != b`):
+
+```go
+parquetfast.Where(parquetfast.Col("region").In("us", "eu", "apac"))
+```
 
 ```go
 // region == "eu" AND (status == "error" OR latency_ms > 1000)

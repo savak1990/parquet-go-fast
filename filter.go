@@ -91,6 +91,18 @@ func (c ColRef) GreaterOrEqual(v any) Predicate { return c.leaf(opGe, v, nil) }
 // Between matches rows where lo <= column <= hi (inclusive).
 func (c ColRef) Between(lo, hi any) Predicate { return c.leaf(opBetween, lo, hi) }
 
+// In matches rows whose column equals any of vals. It is an Or of equality
+// checks, so it prunes per value via statistics and bloom filters. In() with no
+// values matches nothing.
+func (c ColRef) In(vals ...any) Predicate {
+	children := make([]Predicate, len(vals))
+	for i, v := range vals {
+		children[i] = c.Equal(v)
+	}
+
+	return Predicate{kind: predOr, children: children}
+}
+
 // And matches rows satisfying all of preds. Nestable with Or.
 func And(preds ...Predicate) Predicate { return Predicate{kind: predAnd, children: preds} }
 
