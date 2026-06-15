@@ -40,6 +40,26 @@ best suited for, and the favorable case for any columnar reader (this library
 included): nested/map-heavy schemas decode through the slower row path and are a
 separate story (see [Architecture](#architecture)).
 
+The decoded record — numeric/timestamp-heavy, one small string:
+
+```go
+type Taxi struct {
+    VendorID            int32     `parquet:"VendorID"`
+    PickupTime          time.Time `parquet:"tpep_pickup_datetime"`
+    DropoffTime         time.Time `parquet:"tpep_dropoff_datetime"`
+    PassengerCount      int64     `parquet:"passenger_count"`
+    TripDistance        float64   `parquet:"trip_distance"`
+    RatecodeID          int64     `parquet:"RatecodeID"`
+    StoreAndFwdFlag     string    `parquet:"store_and_fwd_flag"`
+    PULocationID        int32     `parquet:"PULocationID"`
+    DOLocationID        int32     `parquet:"DOLocationID"`
+    PaymentType         int64     `parquet:"payment_type"`
+    FareAmount          float64   `parquet:"fare_amount"`
+    Extra               float64   `parquet:"extra"`
+    // …7 more float64 fee columns (mta_tax, tip_amount, total_amount, …)
+}
+```
+
 **Full read — all 19 columns → rows.** Read every row and column into records.
 The Go readers and DuckDB→Go return a `[]struct`; arrow-go returns columnar Arrow
 arrays (no per-row objects, so it does strictly less work), shown for reference.
@@ -85,6 +105,71 @@ parquet-go-fast is shown single-core and with `WithConcurrency`.
   and **~2× with `WithConcurrency`** (they still win via SIMD predicate eval and
   by skipping output decode for non-matching pages). Row-group/page pruning makes
   selective scans on sorted/clustered columns far cheaper still.
+
+### Open-Orca — string-heavy text (HuggingFace)
+
+[Open-Orca/OpenOrca](https://huggingface.co/datasets/Open-Orca/OpenOrca),
+~995 K rows × **4 string columns** (~1 GB). The opposite of taxi: all `BYTE_ARRAY`,
+so the typed numeric gather doesn't apply (strings use the boxed columnar
+fallback) and decode is dominated by copying bytes into Go strings. (`-benchtime=3x`.)
+
+The decoded record — all strings:
+
+```go
+type OpenOrca struct {
+    ID           string `parquet:"id"`
+    SystemPrompt string `parquet:"system_prompt"`
+    Question     string `parquet:"question"`
+    Response     string `parquet:"response"`
+}
+```
+
+**Full read — 4 columns → rows**
+
+| Reader | Time | allocs/op |
+|---|---:|---:|
+| **parquet-go-fast** (concurrent) | **1562 ms** | 3.9 M |
+| arrow-go → rows | 1710 ms | 27 K |
+| parquet-go-fast (single core) | 1784 ms | 3.9 M |
+| parquet-go | 1928 ms | 6.9 M |
+| DuckDB → Go | 2076 ms | 15.7 M |
+
+**Projection — 2 of 4 → rows**
+
+| Reader | Time |
+|---|---:|
+| arrow-go → rows | 913 ms |
+| **parquet-go-fast** | 920 ms |
+| DuckDB → Go | 967 ms |
+| parquet-go | 1062 ms |
+
+**Filter — `system_prompt == …` (224 K matches) → rows**
+
+| Reader | Time |
+|---|---:|
+| **DuckDB → Go** | 531 ms |
+| **parquet-go-fast** | 886 ms |
+| parquet-go | 1849 ms |
+
+#### Where we stand on this file
+
+- **Competitive, not dominant.** On strings we're ~tied with arrow-go and modestly
+  ahead of parquet-go/DuckDB — the numeric blowout doesn't carry over, because
+  string decode is **byte-copy-bound** (every reader pays it) and can't use the
+  typed gather.
+- **arrow-go doesn't actually hand back a Go slice here.** It returns columnar
+  Arrow arrays; the `arrow-go → rows` column is *our* transpose, and for strings it
+  yields values that **alias Arrow's buffer (views)** — not independent Go strings,
+  and invalid once the Arrow table is released. That's why its alloc count is 27 K
+  vs our 3.9 M: it never *owns* the strings, whereas a `[]OpenOrca` from
+  parquet-go-fast (or parquet-go) is fully independent, GC-safe data. Apples to
+  oranges on allocations — read the *time* as the comparable figure.
+- **String filters take the row path** (string predicate ≠ the numeric columnar
+  filter); ~1.7× behind DuckDB — far closer than numeric filters once were.
+- **Concurrency barely helps here** — string materialization is allocation/GC-bound,
+  not CPU-bound.
+
+---
 
 **Use parquet-go-fast** when your Go code needs rows as typed structs (ETL, event
 replay, feeding services). **Reach for a query engine** (DuckDB, ClickHouse) for

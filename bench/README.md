@@ -25,15 +25,22 @@ Comparing "build 2.96 M structs" (A) to "compute one `SUM` and discard the data"
 [`sql/engines.sh`](sql/engines.sh) are **C**, kept only for context and clearly
 labeled as not comparable.
 
-## Dataset
+## Datasets
 
-NYC TLC **yellow-taxi** trip records (public:
-<https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page>) — `2024-01`,
-**2,964,624 rows × 19 columns** (int32/int64/timestamp/double/string, all
-nullable, dictionary-encoded, zstd-compressed, 3 row groups, ~48 MB on disk).
+Each dataset gets the same three workloads, across different shapes:
+
+- **NYC TLC yellow-taxi** (<https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page>)
+  — `2024-01`, **2,964,624 rows × 19 columns** (int32/int64/timestamp/double/string,
+  nullable, dictionary-encoded, zstd, 3 row groups, ~48 MB). Flat numeric — the
+  columnar-friendly best case.
+- **Open-Orca** ([HF Open-Orca/OpenOrca](https://huggingface.co/datasets/Open-Orca/OpenOrca),
+  `1M-GPT4-Augmented`) — **~995 K rows × 4 string columns** (~1 GB). String-heavy —
+  exercises the boxed-string fallback and large-value allocation.
 
 ```sh
-./download.sh        # → bench/data/yellow_tripdata_2024-01.parquet  (gitignored)
+./download.sh        # NYC taxi (~48 MB) → bench/data/yellow_tripdata_2024-01.parquet
+./download.sh orca   # Open-Orca (~1 GB) → bench/data/openorca.parquet
+./download.sh all    # both
 ```
 
 ## Workloads
@@ -63,8 +70,17 @@ Useful filters:
 go test -bench 'BenchmarkFull_'  -benchmem -benchtime=5x -run '^$'   # workload 1
 go test -bench 'BenchmarkProj_'  -benchmem -benchtime=5x -run '^$'   # workload 2 (sub-benchmarks 01col/05col/10col)
 go test -bench 'BenchmarkFilter_' -benchmem -benchtime=5x -run '^$'  # workload 3 (sub-benchmarks per predicate)
+go test -bench 'Orca'             -benchmem -benchtime=3x -run '^$'  # Open-Orca suite (set ORCA_FILE or ./download.sh orca)
 go test -run TestFilterCountDiagnostic -v                            # sanity: pushdown count == engines
 ```
+
+> **arrow-go caveat.** arrow-go returns *columnar Arrow arrays*, not a Go
+> `[]struct`. The `arrow-go → rows` benchmarks are our own transpose on top of it;
+> for **string** columns that transpose returns values that alias Arrow's value
+> buffer (views), not independent/GC-owned Go strings (they become invalid once
+> the Arrow table is released). That's why arrow-go's allocation count on
+> string-heavy data is tiny — it doesn't *own* the strings; parquet-go-fast and
+> parquet-go produce a `[]struct` whose strings are independent copies.
 
 The first run compiles the DuckDB cgo library (slow); subsequent runs are fast.
 `reportRows` adds a `rows/s` metric; filter benchmarks add a `matched` count
@@ -88,7 +104,7 @@ count against Go.
 ./sql/engines.sh     # needs the `duckdb` and `clickhouse` CLIs on PATH
 ```
 
-## Results (Apple M4 Pro, Go 1.26, parquet-go v0.30.1, warm cache)
+## Results — NYC taxi (flat numeric; Apple M4 Pro, Go 1.26, warm cache)
 
 Numbers move with hardware; the **ratios** are the takeaway. All Go rows end in a
 `[]struct`; arrow-go's full read is columnar (noted).
@@ -145,6 +161,30 @@ Allocations stay in the **hundreds** for parquet-go-fast across all widths
 option — at full reads *and* projection, ahead of even arrow-go's columnar reader;
 for selective analytical queries, purpose-built engines are the right tool and we
 don't pretend to compete.
+
+## Results — Open-Orca (string-heavy; `-benchtime=3x`)
+
+~995 K rows × 4 string columns (~1 GB). Strings can't use the typed numeric gather
+(boxed columnar fallback), and decode is dominated by copying bytes into Go
+strings — so this is a *competitive*, not dominant, case.
+
+| Workload | parquet-go-fast | arrow-go → rows | DuckDB → Go | parquet-go |
+|---|---:|---:|---:|---:|
+| Full (4 cols) | 1784 / **1562** (conc) ms | 1710 ms | 2076 ms | 1928 ms |
+| Projection (2 cols) | **920 ms** | 913 ms | 967 ms | 1062 ms |
+| Filter (`system_prompt==…`, 224 K) | 886 ms | — | **531 ms** | 1849 ms |
+
+allocs/op, full read: parquet-go-fast 3.9 M · arrow-go **27 K** · parquet-go 6.9 M
+· DuckDB 15.7 M.
+
+- We're **~tied with arrow-go** and modestly ahead of parquet-go/DuckDB on full +
+  projection — the numeric blowout doesn't carry over, because string decode is
+  byte-copy-bound (every reader pays) and can't use the typed gather.
+- **arrow-go is far leaner on allocations** (27 K vs 3.9 M): it keeps strings in one
+  buffer (views), while we copy each value into an independent, GC-safe Go string
+  (~1 alloc/value). A real trade-off.
+- The **string filter takes the row path** (string predicate ≠ numeric columnar
+  filter); ~1.7× behind DuckDB. **Concurrency barely helps** (alloc/GC-bound).
 
 ## Fairness notes / caveats
 
