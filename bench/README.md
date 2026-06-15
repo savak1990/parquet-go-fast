@@ -36,11 +36,15 @@ Each dataset gets the same three workloads, across different shapes:
 - **Open-Orca** ([HF Open-Orca/OpenOrca](https://huggingface.co/datasets/Open-Orca/OpenOrca),
   `1M-GPT4-Augmented`) — **~995 K rows × 4 string columns** (~1 GB). String-heavy —
   exercises the boxed-string fallback and large-value allocation.
+- **dbpedia embeddings** ([HF KShivendu/dbpedia-entities-openai-1M](https://huggingface.co/datasets/KShivendu/dbpedia-entities-openai-1M))
+  — **38,462 rows × 3 strings + a 1536-dim `LIST<double>` embedding** (~350 MB).
+  Nested — the list forces the row path; projecting it away returns to columnar.
 
 ```sh
-./download.sh        # NYC taxi (~48 MB) → bench/data/yellow_tripdata_2024-01.parquet
-./download.sh orca   # Open-Orca (~1 GB) → bench/data/openorca.parquet
-./download.sh all    # both
+./download.sh         # NYC taxi (~48 MB)  → bench/data/yellow_tripdata_2024-01.parquet
+./download.sh orca    # Open-Orca (~1 GB)  → bench/data/openorca.parquet
+./download.sh dbpedia # dbpedia (~350 MB)  → bench/data/dbpedia.parquet
+./download.sh all     # everything
 ```
 
 ## Workloads
@@ -185,6 +189,26 @@ allocs/op, full read: parquet-go-fast 3.9 M · arrow-go **27 K** · parquet-go 6
   (~1 alloc/value). A real trade-off.
 - The **string filter takes the row path** (string predicate ≠ numeric columnar
   filter); ~1.7× behind DuckDB. **Concurrency barely helps** (alloc/GC-bound).
+
+## Results — dbpedia embeddings (nested list; `-benchtime=5x`)
+
+38,462 rows × 3 strings + a 1536-dim `LIST<double>` embedding. The list forces the
+row path on the full read; the projection drops it (columnar path).
+
+| Workload | parquet-go-fast | arrow-go → rows | DuckDB → Go | parquet-go |
+|---|---:|---:|---:|---:|
+| Full (incl. embedding) | 619 / **73** (conc) ms | 751 ms | 673 ms | ⚠️ ~23 ms (empty emb) |
+| Projection (id+title) | **3.1 ms** | 3.1 ms | 11.7 ms | 7.7 ms |
+| Filter (`title<"M"`, 22 634) | **4.4 ms** | — | 6.6 ms | 7.8 ms |
+
+- **We win the nested full read** (concurrent 73 ms, ~9–10× faster than DuckDB and
+  arrow-go) — building Go `[]float64` slices directly beats arrow-go's columnar→row
+  transpose and DuckDB's per-element `[]interface{}` boxing.
+- ⚠️ **parquet-go silently returns empty embeddings** — the list element is named
+  `item`, and its `GenericReader` assumes the spec-default `element`. We resolve the
+  element structurally and read it correctly; parquet-go's ~23 ms decodes nothing
+  for that column (a correctness failure, not a speed win).
+- Projection (drop the list) and string filter both go our way.
 
 ## Fairness notes / caveats
 

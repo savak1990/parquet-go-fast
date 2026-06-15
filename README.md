@@ -183,6 +183,66 @@ type OpenOrca struct {
 - **Concurrency barely helps here** — string materialization is allocation/GC-bound,
   not CPU-bound.
 
+### dbpedia embeddings — nested list + strings (HuggingFace)
+
+[KShivendu/dbpedia-entities-openai-1M](https://huggingface.co/datasets/KShivendu/dbpedia-entities-openai-1M),
+38,462 rows × 3 strings + a 1536-dim OpenAI embedding stored as a `LIST<float64>`
+(~350 MB). The **list makes the record non-scalar-only → the full read takes our
+row path** — the honest counterpart to taxi, and the same class as map/list-heavy
+production data. Projecting just the scalar metadata (dropping the embedding) flips
+it back to the columnar path.
+
+```go
+type WikiEmbedding struct {
+    ID    string    `parquet:"_id"`
+    Title string    `parquet:"title"`
+    Text  string    `parquet:"text"`
+    Emb   []float64 `parquet:"openai"` // 1536-dim embedding (LIST)
+}
+```
+
+**Full read — 3 strings + 1536-d embedding → rows**
+
+| Reader | Time | Note |
+|---|---:|---|
+| **parquet-go-fast** (concurrent) | **73 ms** | ✅ |
+| parquet-go-fast (single core) | 619 ms | ✅ |
+| DuckDB → Go | 673 ms | ✅ (list → `[]interface{}` conversion) |
+| arrow-go → rows | 751 ms | ✅ (columnar → row transpose) |
+| parquet-go | ~23 ms | ⚠️ **drops the embedding (empty `[]float64`)** |
+
+**Projection — id + title (no embedding → columnar) → rows**
+
+| Reader | Time |
+|---|---:|
+| arrow-go → rows | 3.1 ms |
+| **parquet-go-fast** | 3.1 ms |
+| parquet-go | 7.7 ms |
+| DuckDB → Go | 11.7 ms |
+
+**Filter — `title < "M"` (22 634 matches) → rows**
+
+| Reader | Time |
+|---|---:|
+| **parquet-go-fast** | 4.4 ms |
+| DuckDB → Go | 6.6 ms |
+| parquet-go | 7.8 ms |
+
+#### Where we stand on this file
+
+- **We win the nested full read** — concurrent **73 ms**, ~9–10× faster than
+  DuckDB and arrow-go. The row path isn't a liability here: building Go `[]float64`
+  slices *directly* beats arrow-go's columnar→row transpose and DuckDB's
+  per-element `[]interface{}` boxing through `database/sql`.
+- ⚠️ **parquet-go silently drops the embedding** (`len == 0`). The list element is
+  named `item`; parquet-go's `GenericReader` assumes the spec-default `element` and
+  returns empty lists. We resolve the element **structurally** and read it
+  correctly — a real correctness win on real-world data (its ~23 ms is decoding
+  nothing for that column).
+- **Projection that drops the list** is scalar-only → the columnar fast path: tied
+  with arrow-go, ahead of the engines.
+- **String-range filter:** we're the fastest here too.
+
 ---
 
 **Use parquet-go-fast** when your Go code needs rows as typed structs (ETL, event
