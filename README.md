@@ -144,6 +144,10 @@ More selective `trip_distance > 50` (412 matches): DuckDB **8.8 ms** (47 KB), ou
 ~995 K rows × **4 string columns** (~1 GB). The opposite of taxi: all `BYTE_ARRAY`,
 so the typed numeric gather doesn't apply (strings use the boxed columnar
 fallback) and decode is dominated by copying bytes into Go strings. (`-benchtime=3x`.)
+**This file is written as a single row group** (all 994,896 rows, by
+`parquet-cpp-arrow`), so `WithConcurrency` has nothing to fan out and runs
+single-core — concurrency scales with row-group count, and here there's only one
+(cf. taxi 3, dbpedia 39, structwiki 87).
 
 The decoded record — all strings:
 
@@ -200,11 +204,8 @@ type OpenOrca struct {
   *time* as the comparable figure.
 - **String filters take the row path** (string predicate ≠ the numeric columnar
   filter); ~1.7× behind DuckDB's pushdown — far closer than numeric filters once were.
-- **Concurrency gives nothing here — the file has one row group.** `WithConcurrency`
-  fans *row groups* across workers; this file (written by `parquet-cpp-arrow`) packs
-  all 994,896 rows into a single row group, so there's nothing to split and it runs
-  single-core. The other datasets (taxi 3, dbpedia 39, structwiki 87 row groups) get
-  2.6–9× from concurrency.
+- **Concurrency gives nothing here** — the single row group (noted above) leaves
+  `WithConcurrency` nothing to fan out, so it runs single-core.
 
 ### dbpedia embeddings — nested list + strings (HuggingFace)
 
