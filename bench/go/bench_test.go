@@ -140,6 +140,31 @@ func BenchmarkFilter_Ours(b *testing.B) {
 	}
 }
 
+func BenchmarkFilter_OursConcurrent(b *testing.B) {
+	data := readFile(b)
+
+	for _, fc := range filterCases {
+		b.Run(fc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			var matched int
+
+			for b.Loop() {
+				rows, err := parquetfast.UnmarshalBytes[TaxiProjection](data,
+					parquetfast.Where(fc.pred), parquetfast.WithConcurrency(0))
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				matched = len(rows)
+			}
+
+			b.ReportMetric(float64(matched), "matched")
+		})
+	}
+}
+
 // parquet-go has no predicate pushdown via GenericReader, so the fair equivalent
 // is to materialize all rows and filter in Go — what an application would have to
 // do. (This decodes the whole file every time.)

@@ -37,11 +37,11 @@ arrays (no per-row objects, so it does strictly less work), shown for reference.
 
 | Reader | Returns | Time |
 |---|---|---:|
-| **parquet-go-fast** (concurrent) | Go `[]struct` | **182 ms** |
-| arrow-go | Arrow columns | 309 ms |
-| parquet-go-fast (single core) | Go `[]struct` | 482 ms |
-| DuckDB → Go | Go `[]struct` | 2138 ms |
-| parquet-go | Go `[]struct` | 3061 ms |
+| **parquet-go-fast** (concurrent) | Go `[]struct` | **173 ms** |
+| arrow-go | Arrow columns | 311 ms |
+| parquet-go-fast (single core) | Go `[]struct` | 440 ms |
+| DuckDB → Go | Go `[]struct` | 2103 ms |
+| parquet-go | Go `[]struct` | 3041 ms |
 
 **Projection — N of 19 columns → rows.** Read only N columns (a struct with just
 those fields) — tests how well a reader avoids touching the rest. `arrow-go → rows`
@@ -49,18 +49,19 @@ reads N columns into Arrow then transposes to structs (that transpose is in its 
 
 | Columns | parquet-go-fast | arrow-go → rows | DuckDB → Go | parquet-go |
 |---|---:|---:|---:|---:|
-| 1 | **11 ms** | 17 ms | 138 ms | 1790 ms |
-| 5 | **49 ms** | 82 ms | 501 ms | 1968 ms |
-| 10 | **98 ms** | 186 ms | 925 ms | 2205 ms |
+| 1 | **10 ms** | 17 ms | 135 ms | 1905 ms |
+| 5 | **48 ms** | 82 ms | 533 ms | 2046 ms |
+| 10 | **99 ms** | 183 ms | 937 ms | 2292 ms |
 
 **Filter — predicate → matching rows.** Apply a `WHERE` and return only the matches.
 parquet-go has no pushdown (decode all rows, filter in Go); DuckDB and PyArrow push
 the predicate down. arrow-go has no pushdown reader, so it isn't listed here.
+parquet-go-fast is shown single-core and with `WithConcurrency`.
 
-| Predicate (matches) | parquet-go-fast | DuckDB → Go | PyArrow | parquet-go |
-|---|---:|---:|---:|---:|
-| `trip_distance > 50` (412) | 463 ms | **9 ms** | ~9 ms | 1890 ms |
-| `fare_amount > 100` (7 995) | 464 ms | **12 ms** | ~14 ms | 1913 ms |
+| Predicate (matches) | parquet-go-fast | …concurrent | DuckDB → Go | PyArrow | parquet-go |
+|---|---:|---:|---:|---:|---:|
+| `trip_distance > 50` (412) | 44 ms | **17 ms** | 9 ms | ~9 ms | 1971 ms |
+| `fare_amount > 100` (7 995) | 43 ms | **17 ms** | 12 ms | ~14 ms | 1968 ms |
 
 ### Where we stand — honestly
 
@@ -68,11 +69,13 @@ the predicate down. arrow-go has no pushdown reader, so it isn't listed here.
   faster than arrow-go's columnar read, which doesn't even build structs — and
   projection at every width (~1.7–1.8× faster than arrow-go→rows, 4–10× faster
   than DuckDB→Go), with allocations in the **hundreds** vs thousands–millions.
-- ❌ **We lose selective filters to query engines by ~50×.** DuckDB/PyArrow decode
-  only the filter column, then fetch other columns *only for matching rows* (late
-  materialization) and evaluate the predicate with SIMD. We currently decode all
-  selected columns and filter per row. We stay ~4× ahead of the other Go reader;
-  closing the engine gap (late materialization) is planned.
+- 🟡 **Selective filters are competitive, no longer a blowout.** A filtered read
+  decodes the output columns once (typed), evaluates the predicate over the
+  decoded values, and keeps the matches — ~10× faster than the old per-row path
+  and **~40× faster than parquet-go**. We trail DuckDB/PyArrow by ~5× single-core
+  and **~2× with `WithConcurrency`** (they still win via SIMD predicate eval and
+  by skipping output decode for non-matching pages). Row-group/page pruning makes
+  selective scans on sorted/clustered columns far cheaper still.
 
 **Use parquet-go-fast** when your Go code needs rows as typed structs (ETL, event
 replay, feeding services). **Reach for a query engine** (DuckDB, ClickHouse) for
@@ -214,7 +217,11 @@ region).
 
 On top of the hot path: a process-wide plan cache, all-null-column elision,
 column projection, and predicate pushdown (row-group + page pruning, sorted-column
-binary search, bloom filters).
+binary search, bloom filters). Filtered reads of scalar-only structs use the same
+columnar decode — output columns are decoded once, the predicate is evaluated over
+the decoded values, and only matches are kept — and parallelize across row groups
+with `WithConcurrency`; heavily-pruned scans (sorted columns) fall back to a
+row-at-a-time path that seeks over skipped pages.
 
 ## Supported types
 

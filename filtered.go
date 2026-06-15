@@ -17,36 +17,27 @@ import (
 
 // decodeFiltered prunes row groups + pages that can't match the predicates, then
 // decodes the surviving rows and keeps only matching ones (file order). Backs the
-// filtered path of Unmarshal / UnmarshalBytes / UnmarshalFile.
-func decodeFiltered[T any](f *parquet.File, cfg config, plan *Plan, mask []bool) (result []T, err error) {
+// filtered path of Unmarshal / UnmarshalBytes / UnmarshalFile. Each surviving row
+// group is filtered via filterGroup, which takes the columnar late-materialization
+// path when eligible and the row+seek path otherwise.
+func decodeFiltered[T any](f *parquet.File, cfg config, plan *Plan, mask []bool) ([]T, error) {
 	fr, err := newFilteredReader(f, cfg, plan, mask)
 	if err != nil {
 		return nil, err
 	}
 
-	defer func() {
-		if cerr := fr.close(); cerr != nil && err == nil {
-			err = fmt.Errorf("close parquet rows: %w", cerr)
+	out := make([]T, 0)
+
+	for i := range fr.groups {
+		res, ferr := filterGroup[T](fr.groups[i], plan, &fr.root, cfg.batchSize)
+		if ferr != nil {
+			return nil, ferr
 		}
-	}()
 
-	// Upper bound: total rows of the surviving (row-group-pruned) groups.
-	upper := 0
-	for _, g := range fr.groups {
-		upper += int(g.NumRows())
+		out = append(out, res...)
 	}
 
-	out := make([]T, upper)
-	if upper == 0 {
-		return out[:0], nil
-	}
-
-	n, rerr := filteredRead(fr, out)
-	if rerr != nil && !errors.Is(rerr, io.EOF) {
-		return nil, rerr
-	}
-
-	return out[:n], nil
+	return out, nil
 }
 
 // decodeFilteredConcurrent filters across workers: each surviving row group is
@@ -119,6 +110,26 @@ func filterGroup[T any](rg parquet.RowGroup, plan *Plan, root *compiledPredicate
 	ranges := candidateRanges(rg, root)
 	if len(ranges) == 0 {
 		return nil, nil
+	}
+
+	n := int(rg.NumRows())
+
+	// Columnar late-materialization path: when the output is scalar-only and page
+	// pruning didn't shrink the scan much (covered ≥ ~10% of the group), evaluate
+	// the predicate over typed column buffers and materialize matches — far faster
+	// than the boxed row path. The row+seek path below stays for heavily-pruned
+	// (e.g. sorted-column) scans and for compound output / non-numeric predicates.
+	if plan.scalarOnly() {
+		covered := int64(0)
+		for _, rng := range ranges {
+			covered += rng[1] - rng[0]
+		}
+
+		if covered*10 >= int64(n) {
+			if res, handled, cerr := filterGroupColumnar[T](rg, plan, root, n); handled {
+				return res, cerr
+			}
+		}
 	}
 
 	upper := 0
