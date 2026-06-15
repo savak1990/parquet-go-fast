@@ -574,6 +574,65 @@ This mirrors what the same approach achieves on production data
 (`pqtWorkload`-style files): −67% time / −85% bytes / −47% allocs vs the
 reflection reader.
 
+### Versus other technologies (NYC taxi) — the honest picture
+
+The sections above compare against `parquet-go`. For a cross-ecosystem view, the
+[`bench/`](bench/) harness measures the real NYC TLC yellow-taxi file (2.96 M rows
+× 19 mixed columns, warm cache) against **DuckDB** (via its Go driver), **Apache
+Arrow** (`arrow-go`, pure-Go columnar), and **PyArrow** — each materializing into
+a ready-to-use native row collection (a Go `[]struct`; or, for arrow-go's columnar
+read, Arrow arrays). That is the only fair cross-tool axis: query engines are
+built to *prune and stay columnar*, so on filtered/aggregated queries they do far
+less work and win decisively — shown plainly below. Apple M4 Pro, Go 1.26.
+[`bench/README.md`](bench/README.md) has the full methodology and reproduction.
+
+**Full materialization — all 19 columns → rows:**
+
+| Tool | Output | Time |
+|---|---|---:|
+| **parquet-go-fast (concurrent)** | Go `[]struct` | **269 ms** |
+| arrow-go | Arrow (columnar) | 308 ms |
+| parquet-go-fast (single) | Go `[]struct` | 740 ms |
+| DuckDB → Go | Go `[]struct` | 2103 ms |
+| parquet-go `GenericReader` | Go `[]struct` | 3048 ms |
+
+Fastest path to Go structs — our concurrent read even edges out arrow-go's
+columnar read while handing back usable structs.
+
+**Projection — N of 19 columns → rows:**
+
+| Columns | parquet-go-fast | arrow-go → rows | DuckDB → Go | parquet-go |
+|---|---:|---:|---:|---:|
+| 1 | 24 ms | **17 ms** | 133 ms | 1896 ms |
+| 5 | 121 ms | **82 ms** | 498 ms | 2010 ms |
+| 10 | 239 ms | **184 ms** | 922 ms | 2290 ms |
+
+Here **arrow-go wins by ~1.3–1.5×** — its columnar reader avoids the
+`parquet.Value` boxing we still pay. We're a clear second: **4–5× faster than
+DuckDB→Go**, 10–90× faster than parquet-go, at a fraction of the allocations
+(hundreds vs millions).
+
+**Selective filter — predicate → matching rows:**
+
+| Predicate (matches) | parquet-go-fast | DuckDB → Go | parquet-go |
+|---|---:|---:|---:|
+| `trip_distance > 50` (412) | 465 ms | **9 ms** | 2002 ms |
+| `fare_amount > 100` (7 995) | 463 ms | **12 ms** | 2005 ms |
+
+**Here the engines win by ~50×, and we won't pretend otherwise.** DuckDB (and
+PyArrow, ~8 ms) decode only the filter column, find the matching rows, then fetch
+the other columns *only for those rows* (late materialization). We prune row
+groups/pages by statistics, but when matches are scattered across the file (as
+here) little prunes, so we still scan the filter column for every row — roughly
+full-projection cost. We stay ~4× ahead of the other Go option, but closing this
+gap needs late materialization (not yet implemented).
+
+**Bottom line.** For turning parquet into **Go row structs**, this library is the
+fastest option measured (full reads) or a close second (projection, behind only
+arrow-go's columnar path), with dramatically fewer allocations. For **selective
+analytical queries**, purpose-built engines like DuckDB are far faster and the
+right tool — we don't compete there, and the numbers above say so.
+
 Reproduce:
 
 ```sh
