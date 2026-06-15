@@ -255,12 +255,18 @@ instead of `map[string][]int64`.
 
 The suite round-trips every supported shape (`parquet-go` writer → this decoder,
 `reflect.DeepEqual` gate) plus production-shaped records, and stream-decodes
-multi-row-group files checking order-independent aggregates. It is also validated
-against [apache/parquet-testing](https://github.com/apache/parquet-testing) —
-golden files from parquet-mr, parquet-cpp, parquet-rs, Impala, Spark and Presto
-exercising encodings our own writer never emits (DELTA\_\*, BYTE\_STREAM\_SPLIT,
-RLE\_DICTIONARY, Float16, INT96, decimals, LZ4/brotli, legacy lists, …). All
-fixtures are synthetic; no customer data.
+multi-row-group files checking order-independent aggregates.
+
+It is also run against the **entire**
+[apache/parquet-testing](https://github.com/apache/parquet-testing) corpus — the
+Apache spec/compatibility test files written by parquet-mr, parquet-cpp,
+parquet-rs, Impala, Spark and Presto, exercising encodings and edge cases our own
+writer never emits (DELTA\_\*, BYTE\_STREAM\_SPLIT, RLE\_DICTIONARY, Float16,
+INT96, decimals, LZ4/brotli, legacy 2-level lists, maps without required keys,
+null pages, …). Every file the reference reader can open decodes with a matching
+row count and no panics, and a curated set is compared value-for-value against the
+reference reader. (All of the library's own fixtures are synthetic; no customer
+data.)
 
 ```sh
 go test ./...                                                   # full suite
