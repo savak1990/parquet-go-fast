@@ -338,6 +338,19 @@ for each compound closure:   build map / slice / *struct at base+offset
 `base` is a pointer to the destination struct (`&out[i]`). Each scalar write is
 one offset-add plus one typed store — no interface dispatch, no `reflect.Value`.
 
+### Columnar fast path (scalar-only schemas)
+
+When a struct binds **only scalar / optional-scalar leaves** (no maps, lists, or
+optional structs — e.g. a wide analytics row), the materialize path skips
+parquet-go's row reader entirely. Instead of reconstructing each row as a
+`[]parquet.Value` and re-scattering it by column, it reads each bound column's
+chunk in bulk and writes it **strided** into the destination structs
+(`out[i].field`). This removes the per-row assembly and re-scatter passes — on a
+mixed scalar file it is several times faster for projection and meaningfully
+faster for full reads. Any compound field falls back to the row path above, so
+nested schemas are unaffected. It composes with concurrency (each worker decodes
+its row groups column-wise into a disjoint output region).
+
 ### Why an enum switch instead of closures
 
 An earlier design stored a captured closure per leaf column. Storing a

@@ -189,16 +189,21 @@ func decodeFile[T any](f *parquet.File, cfg config) ([]T, error) {
 		return out[:0], nil
 	}
 
+	// The columnar fast path reads only the bound columns directly, so it is
+	// inherently projecting — gate it on cfg.projection so WithoutColumnProjection
+	// still forces the read-everything row path it documents.
+	columnar := cfg.projection && plan.scalarOnly()
+
 	workers := cfg.workers()
 	if workers > 1 && len(rgs) > 1 {
-		if err := decodeConcurrent(rgs, plan, mask, out, cfg.batchSize, min(workers, len(rgs))); err != nil {
+		if err := decodeConcurrent(rgs, plan, mask, out, cfg.batchSize, min(workers, len(rgs)), columnar); err != nil {
 			return nil, err
 		}
 
 		return out, nil
 	}
 
-	if err := decodeInto(rgs, plan, mask, out, cfg.batchSize); err != nil {
+	if err := decodeInto(rgs, plan, mask, out, cfg.batchSize, columnar); err != nil {
 		return nil, err
 	}
 
@@ -207,7 +212,12 @@ func decodeFile[T any](f *parquet.File, cfg config) ([]T, error) {
 
 // decodeInto opens the (masked, possibly multi-) row-group stream and decodes
 // every row into out, verifying the row count.
-func decodeInto[T any](rgs []parquet.RowGroup, plan *Plan, skip []bool, out []T, batchSize int) (err error) {
+func decodeInto[T any](rgs []parquet.RowGroup, plan *Plan, skip []bool, out []T, batchSize int, columnar bool) (err error) {
+	// Scalar-only schemas take the columnar fast path (no row assembly / re-scatter).
+	if columnar {
+		return decodeColumnar(rgs, plan, out, make([]parquet.Value, columnarBatch))
+	}
+
 	rows := openRows(rgs, skip)
 
 	defer func() {
@@ -248,7 +258,7 @@ func openRows(rgs []parquet.RowGroup, skip []bool) parquet.Rows {
 // pulling the next row group from a shared counter and writing into that group's
 // disjoint region of out. Requires the file's io.ReaderAt to support concurrent
 // ReadAt (parquet-go reads each row group through an independent SectionReader).
-func decodeConcurrent[T any](rgs []parquet.RowGroup, plan *Plan, skip []bool, out []T, batchSize, workers int) error {
+func decodeConcurrent[T any](rgs []parquet.RowGroup, plan *Plan, skip []bool, out []T, batchSize, workers int, columnar bool) error {
 	// Per-row-group output offsets.
 	offsets := make([]int, len(rgs))
 	off := 0
@@ -283,8 +293,18 @@ func decodeConcurrent[T any](rgs []parquet.RowGroup, plan *Plan, skip []bool, ou
 			defer wg.Done()
 
 			// Per-worker scratch, reused across the row groups this worker takes.
-			rowBatch := make([]parquet.Row, batchSize)
-			leafVals := make([][]parquet.Value, plan.NumLeaves())
+			var (
+				rowBatch []parquet.Row
+				leafVals [][]parquet.Value
+				valBatch []parquet.Value
+			)
+
+			if columnar {
+				valBatch = make([]parquet.Value, columnarBatch)
+			} else {
+				rowBatch = make([]parquet.Row, batchSize)
+				leafVals = make([][]parquet.Value, plan.NumLeaves())
+			}
 
 			for {
 				i := int(next.Add(1)) - 1
@@ -293,6 +313,20 @@ func decodeConcurrent[T any](rgs []parquet.RowGroup, plan *Plan, skip []bool, ou
 				}
 
 				want := int(rgs[i].NumRows())
+				if want == 0 {
+					continue
+				}
+
+				if columnar {
+					if err := decodeColumnarRG(rgs[i], plan, out, offsets[i], valBatch); err != nil {
+						record(fmt.Errorf("row group %d: %w", i, err))
+
+						return
+					}
+
+					continue
+				}
+
 				sub := out[offsets[i] : offsets[i]+want]
 
 				rows := NewMaskedRowGroup(rgs[i], skip).Rows()
