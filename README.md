@@ -20,15 +20,29 @@ writes — no per-row reflection.
 ## Performance
 
 Benchmarks live in [`bench/`](bench/) (full methodology + reproduction). Each
-reader is measured end to end into a **ready-to-use native row collection**, and
+reader is measured **end to end into a ready-to-use native row collection**, and
 compared *within category* — full materialization vs columnar decode vs analytical
 query are different amounts of work, so they're never mixed. Apple M4 Pro, Go 1.26.
 
-> **What each reader hands back matters.** Only parquet-go-fast and parquet-go
-> return an idiomatic Go `[]struct` directly. **arrow-go** returns *columnar Arrow
-> arrays* — its "→ rows" numbers include the column→struct transpose you'd
-> otherwise write yourself. **DuckDB→Go** goes through `database/sql` (per-cell
-> `Scan`); **PyArrow** is a different runtime (Python objects).
+**Readers compared — and exactly what we run for each:**
+
+| Reader | Library / mechanism | Output |
+|---|---|---|
+| **parquet-go-fast** | this library — `UnmarshalBytes` / `WithConcurrency` | Go `[]struct` |
+| parquet-go | [`parquet-go/parquet-go`](https://github.com/parquet-go/parquet-go) `GenericReader` (reflection) | Go `[]struct` |
+| arrow-go | [`apache/arrow-go`](https://github.com/apache/arrow-go) `pqarrow` — pure-Go **columnar** read + our transpose to rows | Arrow arrays → `[]struct`\* |
+| DuckDB → Go | [`marcboeker/go-duckdb`](https://github.com/marcboeker/go-duckdb) (cgo) over `database/sql` — `Scan` into structs | Go `[]struct` |
+| PyArrow | Python [`pyarrow`](https://arrow.apache.org/docs/python/) — `read_table` (columnar) / `to_pylist` (rows) | Arrow / Python list |
+
+\* Only parquet-go-fast and parquet-go return a Go `[]struct` natively. **arrow-go
+returns columnar Arrow arrays** — the "→ rows" numbers are *our* transpose on top,
+and for string columns those values alias Arrow's buffer (views), not independent
+Go strings (which is why its allocation counts look so low). **DuckDB → Go** is the
+real in-process cgo driver going through `database/sql` (the per-cell `Scan` is the
+bulk of its allocations) — not the CLI. **PyArrow** is a different runtime (Python),
+shown for cross-ecosystem context. The DuckDB/ClickHouse *CLI* appears only in
+[`bench/sql/engines.sh`](bench/sql/engines.sh) for scalar analytical queries that
+never materialize rows — not in any table here.
 
 ### NYC TLC yellow-taxi — flat, columnar-friendly analytical file
 
