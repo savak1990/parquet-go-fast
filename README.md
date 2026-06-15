@@ -5,6 +5,10 @@ reads parquet files into Go structs far faster — and with orders of magnitude
 fewer allocations — than the reflection-driven reader in
 [`parquet-go/parquet-go`](https://github.com/parquet-go/parquet-go).
 
+> 📊 **Benchmarks:** see [Performance](#performance) — full-read, projection, and
+> filtered comparisons vs parquet-go, arrow-go, and DuckDB→Go across four dataset
+> shapes (flat numeric, string-heavy, nested list, deeply nested).
+
 ```go
 import parquetfast "github.com/savak1990/parquet-go-fast"
 
@@ -22,6 +26,162 @@ reads files written by any spec-conformant writer (parquet-go, Arrow, Spark,
 DuckDB, pandas, …). It compiles the `(Go type, file schema)` mapping
 **once** and then decodes every row through precompiled, typed `unsafe.Pointer`
 writes — no per-row reflection.
+
+## Install
+
+```sh
+go get github.com/savak1990/parquet-go-fast
+```
+
+## Usage
+
+Use the same `parquet:"..."` struct tags that `parquet-go`'s writer reads.
+
+### Decode a whole file
+
+```go
+type Row struct {
+    Name   string            `parquet:"name"`
+    Count  int64             `parquet:"count"`
+    Labels map[string]string `parquet:"labels"`
+}
+
+rows, err := parquetfast.UnmarshalFile[Row]("data.parquet") // from disk
+rows, err := parquetfast.UnmarshalBytes[Row](data)          // from memory
+rows, err := parquetfast.Unmarshal[Row](r, size)            // any io.ReaderAt
+```
+
+### Stream large files (bounded memory)
+
+Reuse a destination buffer instead of holding the whole `[]T`:
+
+```go
+rd, err := parquetfast.NewReader[Row](f, size)
+if err != nil { /* ... */ }
+defer rd.Close()
+
+buf := make([]Row, 4096)
+for {
+    n, err := rd.Read(buf)
+    process(buf[:n])
+    if err == io.EOF { break }
+    if err != nil { return err }
+}
+```
+
+### Read only some columns (projection)
+
+Decode into a struct with just the fields you need; unreferenced columns are
+skipped in the read pipeline (no fetch, decompress, or decode):
+
+```go
+type Slim struct {
+    ID   int64  `parquet:"id"`
+    Name string `parquet:"name"`
+}
+rows, err := parquetfast.UnmarshalFile[Slim]("wide.parquet") // reads 2 columns, not 50
+```
+
+### Filter rows (predicate pushdown)
+
+```go
+rows, err := parquetfast.UnmarshalFile[Event]("events.parquet",
+    parquetfast.Where(
+        parquetfast.Col("ts").Between(start, end),
+        parquetfast.Col("region").Equal("eu"), // multiple predicates are ANDed
+    ))
+```
+
+Build leaf predicates with `Col(path...)` and one of `Equal`, `NotEqual`, `Less`,
+`LessOrEqual`, `Greater`, `GreaterOrEqual`, `Between`, `In`; combine with `And`,
+`Or`, `Not` (nestable). The result contains **only matching rows**, in file order.
+Row groups and pages that can't match (column stats / bloom filter) are skipped.
+The filter column need not be a field of your struct.
+
+### Decode across cores
+
+```go
+rows, err := parquetfast.UnmarshalFile[Row]("big.parquet", parquetfast.WithConcurrency(0)) // 0 = GOMAXPROCS
+```
+
+Results stay in file order. Works on `Unmarshal*` (with or without `Where`) and on
+the streaming `Reader`; speedup scales with the number of row groups. Needs a
+concurrent-safe `io.ReaderAt` (`*os.File`, `*bytes.Reader`, and S3 readers qualify).
+
+### Read from S3 / remote storage
+
+```go
+ra := parquetfast.ReaderAtFunc(func(p []byte, off int64) (int, error) {
+    // issue an S3 GetObject with a Range header for [off, off+len(p))
+    return n, err
+})
+rows, err := parquetfast.Unmarshal[Row](ra, size, parquetfast.WithOptimisticRead())
+```
+
+Parquet's footer-first layout means a projected/filtered read fetches a small
+fraction of the object. Tune with `WithReadBufferSize`, `WithAsyncReads`, and
+`WithFileOptions`.
+
+### Nested types: optional registration
+
+Nested structs, struct slices, and struct-valued maps decode correctly out of the
+box (a reflect fallback). For an allocation-light typed path, register them once:
+
+```go
+func init() {
+    parquetfast.RegisterStructAlloc[Address]()                      // *Struct fields
+    parquetfast.RegisterStructList[LineItem]()                      // []Struct fields
+    parquetfast.RegisterStructValuedMap[string, Product](keyDecode) // map[K]Struct fields
+}
+```
+
+## Architecture
+
+The whole design serves one goal: **get bytes from the file into Go struct fields
+with the least possible work per value.**
+
+**Compile once, then no reflection.** The first decode of a given `(Go type, file
+schema)` walks both with reflection a single time and compiles a **plan**: a flat
+list of scalar *setters* — `{column index, field byte-offset, type kind}` — plus one
+closure per compound field (map, list, optional struct). After that, writing a value
+is a typed `switch` that stores straight to `base + offset` through `unsafe.Pointer`
+— no `reflect.Value`, no interface boxing, no per-field call on the hot path. Plans
+are cached process-wide (keyed on type, schema, and null-column shape), so reflection
+is paid once per process, not once per row.
+
+**Scalar-only schemas take a columnar fast path — this is the speed story.** When the
+struct has no maps, lists, or optional structs, the decoder skips parquet-go's row
+reader (and its row-assembly step) entirely and reads **one column at a time**,
+writing strided into the output structs. Numeric columns go **straight from the
+page's typed buffer** — dictionary indices resolved against the dictionary's typed
+values, nulls placed from the definition levels — with **no `parquet.Value` boxing
+and one typed store per cell**. That is why full reads and projection beat even
+arrow-go's columnar reader: we write directly into the final `[]struct`, whereas a
+columnar reader still has to transpose its arrays into rows afterward.
+Strings/bools/`time.Time`/optionals use a still-columnar but boxed read; any compound
+field drops to the row path below, so nested schemas are simply unaffected.
+
+**Nested schemas use the row path.** Maps, lists, and optional structs decode through
+parquet-go's row reader, after which the plan's setters and closures populate the
+struct. List columns are resolved **structurally** from the schema tree, so a plain
+`[]T` reads any spec-conformant 3-level `LIST` no matter how its inner levels are
+named (`element`, `item`, `array`).
+
+**Concurrency is row-group parallelism.** `WithConcurrency(n)` fans the file's row
+groups across `n` worker goroutines; each decodes whole row groups into a **disjoint
+region** of the pre-allocated `[]T`, so there is no locking and no merge step. Speedup
+therefore scales with the **number of row groups** — a single-row-group file can't be
+split and runs sequentially. It requires a concurrency-safe `io.ReaderAt`;
+`UnmarshalFile` and `UnmarshalBytes` both qualify.
+
+**Skip work before decoding it.** Column projection touches only the bound columns;
+predicate pushdown prunes whole row groups and pages (min/max stats, sorted-column
+binary search, bloom filters) before anything is decoded. A filtered read of a
+scalar-only struct reuses the columnar path: it decodes the output columns once,
+evaluates the predicate over the **already-decoded** values (the filter column is
+never read twice), keeps the matches, and parallelizes across row groups too.
+Heavily-pruned scans on sorted columns instead use a row-at-a-time path that seeks
+over the skipped pages.
 
 ## Performance
 
@@ -381,162 +541,6 @@ DuckDB returns nested columns boxed; arrow-go returns columnar (no row transpose
 **Use parquet-go-fast** when your Go code needs rows as typed structs (ETL, event
 replay, feeding services). **Reach for a query engine** (DuckDB, ClickHouse) for
 selective analytical queries where you never need the rows materialized in Go.
-
-## Install
-
-```sh
-go get github.com/savak1990/parquet-go-fast
-```
-
-## Usage
-
-Use the same `parquet:"..."` struct tags that `parquet-go`'s writer reads.
-
-### Decode a whole file
-
-```go
-type Row struct {
-    Name   string            `parquet:"name"`
-    Count  int64             `parquet:"count"`
-    Labels map[string]string `parquet:"labels"`
-}
-
-rows, err := parquetfast.UnmarshalFile[Row]("data.parquet") // from disk
-rows, err := parquetfast.UnmarshalBytes[Row](data)          // from memory
-rows, err := parquetfast.Unmarshal[Row](r, size)            // any io.ReaderAt
-```
-
-### Stream large files (bounded memory)
-
-Reuse a destination buffer instead of holding the whole `[]T`:
-
-```go
-rd, err := parquetfast.NewReader[Row](f, size)
-if err != nil { /* ... */ }
-defer rd.Close()
-
-buf := make([]Row, 4096)
-for {
-    n, err := rd.Read(buf)
-    process(buf[:n])
-    if err == io.EOF { break }
-    if err != nil { return err }
-}
-```
-
-### Read only some columns (projection)
-
-Decode into a struct with just the fields you need; unreferenced columns are
-skipped in the read pipeline (no fetch, decompress, or decode):
-
-```go
-type Slim struct {
-    ID   int64  `parquet:"id"`
-    Name string `parquet:"name"`
-}
-rows, err := parquetfast.UnmarshalFile[Slim]("wide.parquet") // reads 2 columns, not 50
-```
-
-### Filter rows (predicate pushdown)
-
-```go
-rows, err := parquetfast.UnmarshalFile[Event]("events.parquet",
-    parquetfast.Where(
-        parquetfast.Col("ts").Between(start, end),
-        parquetfast.Col("region").Equal("eu"), // multiple predicates are ANDed
-    ))
-```
-
-Build leaf predicates with `Col(path...)` and one of `Equal`, `NotEqual`, `Less`,
-`LessOrEqual`, `Greater`, `GreaterOrEqual`, `Between`, `In`; combine with `And`,
-`Or`, `Not` (nestable). The result contains **only matching rows**, in file order.
-Row groups and pages that can't match (column stats / bloom filter) are skipped.
-The filter column need not be a field of your struct.
-
-### Decode across cores
-
-```go
-rows, err := parquetfast.UnmarshalFile[Row]("big.parquet", parquetfast.WithConcurrency(0)) // 0 = GOMAXPROCS
-```
-
-Results stay in file order. Works on `Unmarshal*` (with or without `Where`) and on
-the streaming `Reader`; speedup scales with the number of row groups. Needs a
-concurrent-safe `io.ReaderAt` (`*os.File`, `*bytes.Reader`, and S3 readers qualify).
-
-### Read from S3 / remote storage
-
-```go
-ra := parquetfast.ReaderAtFunc(func(p []byte, off int64) (int, error) {
-    // issue an S3 GetObject with a Range header for [off, off+len(p))
-    return n, err
-})
-rows, err := parquetfast.Unmarshal[Row](ra, size, parquetfast.WithOptimisticRead())
-```
-
-Parquet's footer-first layout means a projected/filtered read fetches a small
-fraction of the object. Tune with `WithReadBufferSize`, `WithAsyncReads`, and
-`WithFileOptions`.
-
-### Nested types: optional registration
-
-Nested structs, struct slices, and struct-valued maps decode correctly out of the
-box (a reflect fallback). For an allocation-light typed path, register them once:
-
-```go
-func init() {
-    parquetfast.RegisterStructAlloc[Address]()                      // *Struct fields
-    parquetfast.RegisterStructList[LineItem]()                      // []Struct fields
-    parquetfast.RegisterStructValuedMap[string, Product](keyDecode) // map[K]Struct fields
-}
-```
-
-## Architecture
-
-The whole design serves one goal: **get bytes from the file into Go struct fields
-with the least possible work per value.**
-
-**Compile once, then no reflection.** The first decode of a given `(Go type, file
-schema)` walks both with reflection a single time and compiles a **plan**: a flat
-list of scalar *setters* — `{column index, field byte-offset, type kind}` — plus one
-closure per compound field (map, list, optional struct). After that, writing a value
-is a typed `switch` that stores straight to `base + offset` through `unsafe.Pointer`
-— no `reflect.Value`, no interface boxing, no per-field call on the hot path. Plans
-are cached process-wide (keyed on type, schema, and null-column shape), so reflection
-is paid once per process, not once per row.
-
-**Scalar-only schemas take a columnar fast path — this is the speed story.** When the
-struct has no maps, lists, or optional structs, the decoder skips parquet-go's row
-reader (and its row-assembly step) entirely and reads **one column at a time**,
-writing strided into the output structs. Numeric columns go **straight from the
-page's typed buffer** — dictionary indices resolved against the dictionary's typed
-values, nulls placed from the definition levels — with **no `parquet.Value` boxing
-and one typed store per cell**. That is why full reads and projection beat even
-arrow-go's columnar reader: we write directly into the final `[]struct`, whereas a
-columnar reader still has to transpose its arrays into rows afterward.
-Strings/bools/`time.Time`/optionals use a still-columnar but boxed read; any compound
-field drops to the row path below, so nested schemas are simply unaffected.
-
-**Nested schemas use the row path.** Maps, lists, and optional structs decode through
-parquet-go's row reader, after which the plan's setters and closures populate the
-struct. List columns are resolved **structurally** from the schema tree, so a plain
-`[]T` reads any spec-conformant 3-level `LIST` no matter how its inner levels are
-named (`element`, `item`, `array`).
-
-**Concurrency is row-group parallelism.** `WithConcurrency(n)` fans the file's row
-groups across `n` worker goroutines; each decodes whole row groups into a **disjoint
-region** of the pre-allocated `[]T`, so there is no locking and no merge step. Speedup
-therefore scales with the **number of row groups** — a single-row-group file can't be
-split and runs sequentially. It requires a concurrency-safe `io.ReaderAt`;
-`UnmarshalFile` and `UnmarshalBytes` both qualify.
-
-**Skip work before decoding it.** Column projection touches only the bound columns;
-predicate pushdown prunes whole row groups and pages (min/max stats, sorted-column
-binary search, bloom filters) before anything is decoded. A filtered read of a
-scalar-only struct reuses the columnar path: it decodes the output columns once,
-evaluates the predicate over the **already-decoded** values (the filter column is
-never read twice), keeps the matches, and parallelizes across row groups too.
-Heavily-pruned scans on sorted columns instead use a row-at-a-time path that seeks
-over the skipped pages.
 
 ## Supported types
 
