@@ -63,6 +63,24 @@ func benchOurs[T any](b *testing.B, data []byte) {
 	reportRows(b, total)
 }
 
+func benchOursConc[T any](b *testing.B, data []byte) {
+	b.Helper()
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	total := 0
+	for b.Loop() {
+		rows, err := parquetfast.UnmarshalBytes[T](data, parquetfast.WithConcurrency(0))
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		total += len(rows)
+	}
+
+	reportRows(b, total)
+}
+
 func benchParquetGo[T any](b *testing.B, data []byte) {
 	b.Helper()
 	b.ReportAllocs()
@@ -93,6 +111,12 @@ func BenchmarkProj_ParquetGo(b *testing.B) {
 	b.Run("01col", func(b *testing.B) { benchParquetGo[Taxi1](b, data) })
 	b.Run("05col", func(b *testing.B) { benchParquetGo[Taxi5](b, data) })
 	b.Run("10col", func(b *testing.B) { benchParquetGo[Taxi10](b, data) })
+}
+
+// concurrent projection at the representative 5-of-19 size (table reports 05col).
+func BenchmarkProj_OursConcurrent(b *testing.B) {
+	data := readFile(b)
+	b.Run("05col", func(b *testing.B) { benchOursConc[Taxi5](b, data) })
 }
 
 // ── arrow-go: columnar read of the projection columns, transposed to rows ─────

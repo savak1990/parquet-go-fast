@@ -39,10 +39,20 @@ returns columnar Arrow arrays** — the "→ rows" numbers are *our* transpose o
 and for string columns those values alias Arrow's buffer (views), not independent
 Go strings (which is why its allocation counts look so low). **DuckDB → Go** is the
 real in-process cgo driver going through `database/sql` (the per-cell `Scan` is the
-bulk of its allocations) — not the CLI. **PyArrow** is a different runtime (Python),
-shown for cross-ecosystem context. The DuckDB/ClickHouse *CLI* appears only in
+bulk of its allocations) — not the CLI. **PyArrow** is a different runtime (Python);
+it lives in the [`bench/sql`](bench/sql) scripts for cross-ecosystem context and is
+not in the Go tables below. The DuckDB/ClickHouse *CLI* appears only in
 [`bench/sql/engines.sh`](bench/sql/engines.sh) for scalar analytical queries that
 never materialize rows — not in any table here.
+
+Every table reports **Time** (ns/op → ms), **Mem** (B/op) and **Alloc** (allocs/op)
+from `go test -benchmem`, hot cache, min of repeats. **Returns** names what the
+reader actually hands back (a Go `[]struct`, Arrow columns, or boxed values).
+⚠️ **DuckDB → Go's Mem/Alloc count only Go-heap allocations** the Go runtime sees
+(the `database/sql` `Scan` destinations + driver row buffers); the DuckDB C++ engine's
+native (malloc) working set is invisible to `benchmem`, so its real footprint is
+higher than shown. arrow-go's buffers are Go-managed and *are* counted, but its
+string values alias those buffers (views), which is why its alloc counts look tiny.
 
 ### NYC TLC yellow-taxi — flat, columnar-friendly analytical file
 
@@ -74,51 +84,59 @@ type Taxi struct {
 }
 ```
 
-**Full read — all 19 columns → rows.** Read every row and column into records.
-The Go readers and DuckDB→Go return a `[]struct`; arrow-go returns columnar Arrow
-arrays (no per-row objects, so it does strictly less work), shown for reference.
+**Full read — all 19 columns → rows.** arrow-go returns columnar Arrow arrays
+(builds no per-row objects, so it does strictly less work), shown for reference.
 
-| Reader | Returns | Time |
-|---|---|---:|
-| **parquet-go-fast** (concurrent) | Go `[]struct` | **173 ms** |
-| arrow-go | Arrow columns | 311 ms |
-| parquet-go-fast (single core) | Go `[]struct` | 440 ms |
-| DuckDB → Go | Go `[]struct` | 2103 ms |
-| parquet-go | Go `[]struct` | 3041 ms |
+| Reader | Returns | Time | Mem | Alloc | Note |
+|---|---|--:|--:|--:|---|
+| **parquet-go-fast** (concurrent) | Go `[]struct` | **181 ms** | 578 MB | 1.6 k | |
+| arrow-go | Arrow columns | 310 ms | 978 MB | 193 k | columnar; no row structs |
+| parquet-go-fast | Go `[]struct` | 472 ms | 568 MB | 1.7 k | |
+| DuckDB → Go | Go `[]struct` | 2104 ms | 3.6 GB ⚠️ | 42 M | cgo mem under-counted |
+| parquet-go | Go `[]struct` | 3089 ms | 5.7 GB | 24 M | |
 
-**Projection — N of 19 columns → rows.** Read only N columns (a struct with just
-those fields) — tests how well a reader avoids touching the rest. `arrow-go → rows`
-reads N columns into Arrow then transposes to structs (that transpose is in its time).
+**Projection — 5 of 19 columns → rows.** Read only the selected columns. `arrow-go
+→ rows` reads them into Arrow then transposes (that transpose is in its time).
 
-| Columns | parquet-go-fast | arrow-go → rows | DuckDB → Go | parquet-go |
-|---|---:|---:|---:|---:|
-| 1 | **10 ms** | 17 ms | 135 ms | 1905 ms |
-| 5 | **48 ms** | 82 ms | 533 ms | 2046 ms |
-| 10 | **99 ms** | 183 ms | 937 ms | 2292 ms |
+| Reader | Returns | Time | Mem | Alloc | Note |
+|---|---|--:|--:|--:|---|
+| **parquet-go-fast** (concurrent) | Go `[]struct` | **19 ms** | 119 MB | 0.8 k | |
+| parquet-go-fast | Go `[]struct` | 49 ms | 102 MB | 0.7 k | |
+| arrow-go → rows | Arrow→`[]struct` | 83 ms | 321 MB | 34 k | transpose included |
+| DuckDB → Go | Go `[]struct` | 535 ms | 170 MB | 9.2 M | |
+| parquet-go | Go `[]struct` | 1997 ms | 5.1 GB | 18 M | reads all 19, drops 14 |
 
-**Filter — predicate → matching rows.** Apply a `WHERE` and return only the matches.
-parquet-go has no pushdown (decode all rows, filter in Go); DuckDB and PyArrow push
-the predicate down. arrow-go has no pushdown reader, so it isn't listed here.
-parquet-go-fast is shown single-core and with `WithConcurrency`.
+Scaling (single-core, 1 / 5 / 10 cols): ours **10 / 49 / 99 ms** · arrow-go 17 / 83 /
+190 · DuckDB 136 / 535 / 931 · parquet-go 1947 / 1997 / 2306.
 
-| Predicate (matches) | parquet-go-fast | …concurrent | DuckDB → Go | PyArrow | parquet-go |
-|---|---:|---:|---:|---:|---:|
-| `trip_distance > 50` (412) | 44 ms | **17 ms** | 9 ms | ~9 ms | 1971 ms |
-| `fare_amount > 100` (7 995) | 43 ms | **17 ms** | 12 ms | ~14 ms | 1968 ms |
+**Filter — `fare_amount > 100` (7 995 matches) → rows.** parquet-go has no pushdown
+(decode all, filter in Go); DuckDB pushes the predicate down; arrow-go has no
+pushdown reader (N/A).
+
+| Reader | Returns | Time | Mem | Alloc | Note |
+|---|---|--:|--:|--:|---|
+| **DuckDB → Go** | Go `[]struct` | **12 ms** | 1.2 MB ⚠️ | 24 k | pushdown; materializes only matches |
+| parquet-go-fast (concurrent) | Go `[]struct` | 17 ms | 122 MB | 0.8 k | |
+| parquet-go-fast | Go `[]struct` | 43 ms | 115 MB | 0.8 k | |
+| arrow-go | — | — | — | — | no predicate-pushdown reader |
+| parquet-go | Go `[]struct` | 1986 ms | 5.1 GB | 18 M | decode all, filter in Go |
+
+More selective `trip_distance > 50` (412 matches): DuckDB **8.8 ms** (47 KB), ours-conc
+16 ms, ours 43 ms, parquet-go 1995 ms.
 
 #### Where we stand on this file
 
 - ✅ **Fastest way to get Go structs out of parquet.** We win full reads — 1.7×
   faster than arrow-go's columnar read, which doesn't even build structs — and
-  projection at every width (~1.7–1.8× faster than arrow-go→rows, 4–10× faster
-  than DuckDB→Go), with allocations in the **hundreds** vs thousands–millions.
-- 🟡 **Selective filters are competitive, no longer a blowout.** A filtered read
-  decodes the output columns once (typed), evaluates the predicate over the
-  decoded values, and keeps the matches — ~10× faster than the old per-row path
-  and **~40× faster than parquet-go**. We trail DuckDB/PyArrow by ~5× single-core
-  and **~2× with `WithConcurrency`** (they still win via SIMD predicate eval and
-  by skipping output decode for non-matching pages). Row-group/page pruning makes
-  selective scans on sorted/clustered columns far cheaper still.
+  projection at every width (~1.7–4× faster than arrow-go→rows, ~10–25× faster
+  than DuckDB→Go), with allocations in the **hundreds–thousands** vs millions.
+- 🟡 **Selective filters: close, and now mixed.** A filtered read decodes the output
+  columns once (typed), evaluates the predicate, and keeps the matches — ~40×
+  faster than parquet-go. We trail DuckDB by ~3.5× single-core
+  and **~1.4× with `WithConcurrency`** on the 7 995-match case (it still wins via
+  SIMD eval and by materializing only the matches — note its **1.2 MB** vs our
+  122 MB, since we decode the whole output column). On the very selective 412-match
+  case DuckDB's pushdown keeps a wider lead.
 
 ### Open-Orca — string-heavy text (HuggingFace)
 
@@ -138,50 +156,52 @@ type OpenOrca struct {
 }
 ```
 
-**Full read — 4 columns → rows**
+**Full read — 4 strings → rows**
 
-| Reader | Time | allocs/op |
-|---|---:|---:|
-| **parquet-go-fast** (concurrent) | **1562 ms** | 3.9 M |
-| arrow-go → rows | 1710 ms | 27 K |
-| parquet-go-fast (single core) | 1784 ms | 3.9 M |
-| parquet-go | 1928 ms | 6.9 M |
-| DuckDB → Go | 2076 ms | 15.7 M |
+| Reader | Returns | Time | Mem | Alloc | Note |
+|---|---|--:|--:|--:|---|
+| **parquet-go-fast** (concurrent) | Go `[]struct` | **1618 ms** | 2.0 GB | 3.9 M | |
+| parquet-go-fast | Go `[]struct` | 1645 ms | 2.0 GB | 3.9 M | |
+| DuckDB → Go | Go `[]struct` | 2187 ms | 4.2 GB ⚠️ | 16 M | cgo mem under-counted |
+| arrow-go → rows | Arrow→`[]struct` | 2289 ms | 5.8 GB | 27 k | strings alias Arrow buffer (views) |
+| parquet-go | Go `[]struct` | 2300 ms | 4.2 GB | 6.9 M | |
 
 **Projection — 2 of 4 → rows**
 
-| Reader | Time |
-|---|---:|
-| arrow-go → rows | 913 ms |
-| **parquet-go-fast** | 920 ms |
-| DuckDB → Go | 967 ms |
-| parquet-go | 1062 ms |
+| Reader | Returns | Time | Mem | Alloc | Note |
+|---|---|--:|--:|--:|---|
+| **parquet-go-fast** | Go `[]struct` | **962 ms** | 1.1 GB | 2.0 M | |
+| parquet-go-fast (concurrent) | Go `[]struct` | 974 ms | 1.1 GB | 2.0 M | no gain (string-bound) |
+| DuckDB → Go | Go `[]struct` | 1001 ms | 2.3 GB ⚠️ | 8.0 M | cgo mem under-counted |
+| arrow-go → rows | Arrow→`[]struct` | 1011 ms | 2.9 GB | 13 k | string views |
+| parquet-go | Go `[]struct` | 1154 ms | 2.3 GB | 5.0 M | |
 
 **Filter — `system_prompt == …` (224 K matches) → rows**
 
-| Reader | Time |
-|---|---:|
-| **DuckDB → Go** | 531 ms |
-| **parquet-go-fast** | 886 ms |
-| parquet-go | 1849 ms |
+| Reader | Returns | Time | Mem | Alloc | Note |
+|---|---|--:|--:|--:|---|
+| **DuckDB → Go** | Go `[]struct` | **544 ms** | 512 MB ⚠️ | 1.8 M | predicate pushdown |
+| parquet-go-fast | Go `[]struct` | 920 ms | 1.4 GB | 454 k | |
+| parquet-go-fast (concurrent) | Go `[]struct` | 928 ms | 1.4 GB | 454 k | no gain (string-bound) |
+| arrow-go | — | — | — | — | no predicate-pushdown reader |
+| parquet-go | Go `[]struct` | 2167 ms | 4.2 GB | 6.9 M | |
 
 #### Where we stand on this file
 
-- **Competitive, not dominant.** On strings we're ~tied with arrow-go and modestly
-  ahead of parquet-go/DuckDB — the numeric blowout doesn't carry over, because
-  string decode is **byte-copy-bound** (every reader pays it) and can't use the
-  typed gather.
-- **arrow-go doesn't actually hand back a Go slice here.** It returns columnar
-  Arrow arrays; the `arrow-go → rows` column is *our* transpose, and for strings it
-  yields values that **alias Arrow's buffer (views)** — not independent Go strings,
-  and invalid once the Arrow table is released. That's why its alloc count is 27 K
-  vs our 3.9 M: it never *owns* the strings, whereas a `[]OpenOrca` from
-  parquet-go-fast (or parquet-go) is fully independent, GC-safe data. Apples to
-  oranges on allocations — read the *time* as the comparable figure.
+- **We win full + projection, but modestly.** On strings the numeric blowout doesn't
+  carry over — string decode is **byte-copy-bound** (every reader pays it) and can't
+  use the typed gather. We lead full (1.6 s vs 2.2–2.3 s) and projection (962 ms),
+  but by ~1.2–1.4×, not multiples.
+- **arrow-go doesn't actually hand back a Go slice here.** It returns columnar Arrow
+  arrays; `arrow-go → rows` is *our* transpose, and for strings the values **alias
+  Arrow's buffer (views)** — not independent Go strings (invalid once the table is
+  released). That's why its alloc count is 27 k vs our 3.9 M: it never *owns* the
+  strings, whereas our `[]OpenOrca` is fully independent, GC-safe data. Read the
+  *time* as the comparable figure.
 - **String filters take the row path** (string predicate ≠ the numeric columnar
-  filter); ~1.7× behind DuckDB — far closer than numeric filters once were.
+  filter); ~1.7× behind DuckDB's pushdown — far closer than numeric filters once were.
 - **Concurrency barely helps here** — string materialization is allocation/GC-bound,
-  not CPU-bound.
+  not CPU-bound, so the worker goroutines just contend on the allocator.
 
 ### dbpedia embeddings — nested list + strings (HuggingFace)
 
@@ -203,57 +223,66 @@ type WikiEmbedding struct {
 
 **Full read — 3 strings + 1536-d embedding → rows**
 
-| Reader | Time | Note |
-|---|---:|---|
-| **parquet-go-fast** (concurrent) | **73 ms** | ✅ |
-| parquet-go-fast (single core) | 619 ms | ✅ |
-| DuckDB → Go | 673 ms | ✅ (list → `[]interface{}` conversion) |
-| arrow-go → rows | 751 ms | ✅ (columnar → row transpose) |
-| parquet-go | ~23 ms | ⚠️ **drops the embedding (empty `[]float64`)** |
+| Reader | Returns | Time | Mem | Alloc | Note |
+|---|---|--:|--:|--:|---|
+| **parquet-go-fast** (concurrent) | Go `[]struct` | **73 ms** | 678 MB | 169 k | plain `[]float64`, no tag |
+| parquet-go-fast | Go `[]struct` | 642 ms | 581 MB | 162 k | |
+| DuckDB → Go | `[]struct` + boxed list | 636 ms | 1.6 GB ⚠️ | 60 M | list → `[]interface{}` (boxed); cgo mem under-counted |
+| arrow-go → rows | Arrow→`[]struct` | 741 ms | 2.7 GB | 90 k | columnar → row transpose |
+| parquet-go | Go `[]struct` | 1386 ms | 4.8 GB | 573 k | needs `openai,list` (else empty) |
 
 **Projection — id + title (no embedding → columnar) → rows**
 
-| Reader | Time |
-|---|---:|
-| arrow-go → rows | 3.1 ms |
-| **parquet-go-fast** | 3.1 ms |
-| parquet-go | 7.7 ms |
-| DuckDB → Go | 11.7 ms |
+| Reader | Returns | Time | Mem | Alloc | Note |
+|---|---|--:|--:|--:|---|
+| **parquet-go-fast** (concurrent) | Go `[]struct` | **0.8 ms** | 6.8 MB | 79 k | |
+| parquet-go-fast | Go `[]struct` | 3.2 ms | 6.2 MB | 79 k | |
+| arrow-go → rows | Arrow→`[]struct` | 3.2 ms | 15 MB | 12 k | string views |
+| parquet-go | Go `[]struct` | 7.8 ms | 14 MB | 195 k | |
+| DuckDB → Go | Go `[]struct` | 12 ms | 13 MB ⚠️ | 308 k | cgo mem under-counted |
 
 **Filter — `title < "M"` (22 634 matches) → rows**
 
-| Reader | Time |
-|---|---:|
-| **parquet-go-fast** | 4.4 ms |
-| DuckDB → Go | 6.6 ms |
-| parquet-go | 7.8 ms |
+| Reader | Returns | Time | Mem | Alloc | Note |
+|---|---|--:|--:|--:|---|
+| **parquet-go-fast** (concurrent) | Go `[]struct` | **0.7 ms** | 8.8 MB | 51 k | |
+| parquet-go-fast | Go `[]struct` | 4.5 ms | 11 MB | 51 k | |
+| DuckDB → Go | Go `[]struct` | 6.9 ms | 6.8 MB ⚠️ | 181 k | pushdown; cgo mem under-counted |
+| parquet-go | Go `[]struct` | 8.1 ms | 14 MB | 195 k | |
+| arrow-go | — | — | — | — | no predicate-pushdown reader |
 
 #### Where we stand on this file
 
-- **We win the nested full read** — concurrent **73 ms**, ~9–10× faster than
-  DuckDB and arrow-go. The row path isn't a liability here: building Go `[]float64`
-  slices *directly* beats arrow-go's columnar→row transpose and DuckDB's
-  per-element `[]interface{}` boxing through `database/sql`.
-- ⚠️ **parquet-go silently drops the embedding** (`len == 0`). The list element is
-  named `item`; parquet-go's `GenericReader` assumes the spec-default `element` and
-  returns empty lists. We resolve the element **structurally** and read it
-  correctly — a real correctness win on real-world data (its ~23 ms is decoding
-  nothing for that column).
-- **Projection that drops the list** is scalar-only → the columnar fast path: tied
-  with arrow-go, ahead of the engines.
-- **String-range filter:** we're the fastest here too.
+- **We win the nested full read** — concurrent **73 ms**, ~9× faster than DuckDB
+  and arrow-go and ~19× parquet-go. The row path isn't a liability here: building Go
+  `[]float64` slices *directly* beats arrow-go's columnar→row transpose and DuckDB's
+  per-element `[]interface{}` boxing through `database/sql` (its **60 M** allocations).
+- **Lists need no special tag with this library.** We declare the field as a plain
+  `[]float64` and read it. **parquet-go requires the `,list` struct tag** to bind a
+  3-level `LIST` column — with a bare `[]float64` it silently returns an empty slice
+  (no error), an easy data-loss footgun. The number above is the *fair* parquet-go
+  run, with `openai,list` set so it actually decodes the embedding (its 4.8 GB of
+  allocations are why it's slowest).
+- **DuckDB returns the embedding boxed.** Its driver yields the `LIST<double>` as a
+  `[]interface{}` of `float64` — not a `[]float64`. We leave it boxed (converting it
+  would be work no other reader's number includes) and report it as such.
+- **Projection (drops the list) and string-range filter both go our way** —
+  concurrent sub-millisecond, ahead of every engine here.
 
 ---
 
 ### structured-wikipedia — deeply nested, application-shaped (HuggingFace)
 
 [wikimedia/structured-wikipedia](https://huggingface.co/datasets/wikimedia/structured-wikipedia),
-177,499 rows (~354 MB). The **least** parquet-idiomatic file here and the closest to
-a real application data model: optional structs, lists-of-structs, a `list<string>`,
-and a struct-nested-in-a-struct. Nothing about this is columnar-friendly — the full
-read is *all* row path. (arrow-go/PyArrow are omitted: a hand-written nested→Go
-transpose for a schema this deep is bespoke and fragile, not a fair apples-to-apples
-column read.)
+177,499 rows (~354 MB), **19 top-level fields that flatten to 65 leaf columns**. The
+**least** parquet-idiomatic file here and the closest to a real application data
+model: optional structs, lists-of-structs, a `list<string>`, and a
+struct-nested-in-a-struct. Nothing about this is columnar-friendly — the full read is
+*all* row path. (arrow-go/PyArrow are omitted: a hand-written nested→Go transpose for
+a schema this deep is bespoke and fragile, not a fair apples-to-apples column read.)
+
+The struct below maps a representative subset of the 19 fields — each nested type
+shows the shape (optional struct, list-of-struct, `[]string`, struct-in-struct):
 
 ```go
 type Article struct {
@@ -266,54 +295,78 @@ type Article struct {
     Image      *SWImage  `parquet:"image"`       // optional struct
     MainEntity *SWEntity `parquet:"main_entity"` // optional struct
 
-    AdditionalEntities []SWAddEntity `parquet:"additional_entities"` // list<struct{ list<string>, … }>
+    AdditionalEntities []SWAddEntity `parquet:"additional_entities"` // list<struct{ []string, … }>
     License            []SWLicense   `parquet:"license"`             // list<struct>
 
     Version *SWVersion `parquet:"version"` // struct → *SWEditor (struct-in-struct)
 }
+
+type SWImage   struct{ ContentURL string; Height, Width int64 }
+type SWEntity  struct{ Identifier, URL string }                       // main_entity
+type SWLicense struct{ Identifier, Name, URL string }
+type SWAddEntity struct {
+    Aspects    []string                                               // list<string> inside a list<struct>
+    Identifier string
+    URL        string
+}
+type SWVersion struct{ Comment string; Identifier int64; Editor *SWEditor }
+type SWEditor  struct{ Name string; EditCount int64; Groups []string; IsAdmin bool }
 ```
 
-**Full read — every nested field → rows**
+**Full read — every nested field → rows.** parquet-go is given the `,list` tags it
+needs so it actually decodes the lists (a bare `[]T` reads them empty — see below).
+DuckDB returns nested columns boxed; arrow-go returns columnar (no row transpose).
 
-| Reader | Time | Note |
-|---|---:|---|
-| **parquet-go-fast** (concurrent) | **77 ms** | ✅ |
-| parquet-go-fast (single core) | 490 ms | ✅ |
-| parquet-go | 597 ms | ⚠️ **drops `license` + `additional_entities` (empty lists)** |
+| Reader | Returns | Time | Mem | Alloc | Note |
+|---|---|--:|--:|--:|---|
+| **parquet-go-fast** (concurrent) | Go `[]struct` | **77 ms** | 867 MB | 5.6 M | plain `[]T`, no tag |
+| parquet-go-fast | Go `[]struct` | 505 ms | 798 MB | 5.6 M | |
+| parquet-go | Go `[]struct` | 770 ms | 1.2 GB | 7.6 M | needs `,list` on every list field |
+| DuckDB → Go | `[]struct` + boxed nested | 985 ms | 1.4 GB ⚠️ | 24 M | nested → map / `[]interface{}`; cgo mem under-counted |
+| arrow-go | Arrow columns (nested) | 2473 ms | 8.1 GB | 2.8 M | all 65 leaf cols; no row transpose |
 
 **Projection — `identifier` + `name` + `url` (scalar → columnar) → rows**
 
-| Reader | Time |
-|---|---:|
-| **parquet-go-fast** | 41 ms |
-| DuckDB → Go | 62 ms |
-| parquet-go | 320 ms |
+| Reader | Returns | Time | Mem | Alloc | Note |
+|---|---|--:|--:|--:|---|
+| **parquet-go-fast** (concurrent) | Go `[]struct` | **11 ms** | 67 MB | 499 k | |
+| parquet-go-fast | Go `[]struct` | 43 ms | 62 MB | 499 k | |
+| DuckDB → Go | Go `[]struct` | 63 ms | 80 MB ⚠️ | 1.6 M | cgo mem under-counted |
+| parquet-go | Go `[]struct` | 334 ms | 682 MB | 1.7 M | |
+| arrow-go | — | — | — | — | nested-schema leaf-index mapping bespoke (omitted) |
 
 **Filter — `name < "A"` (79 003 matches) → rows**
 
-| Reader | Time |
-|---|---:|
-| **DuckDB → Go** | 35 ms |
-| parquet-go-fast | 126 ms |
-| parquet-go | 320 ms |
+| Reader | Returns | Time | Mem | Alloc | Note |
+|---|---|--:|--:|--:|---|
+| **parquet-go-fast** (concurrent) | Go `[]struct` | **21 ms** | 95 MB | 335 k | |
+| DuckDB → Go | Go `[]struct` | 38 ms | 41 MB ⚠️ | 712 k | pushdown; cgo mem under-counted |
+| parquet-go-fast | Go `[]struct` | 129 ms | 102 MB | 334 k | |
+| parquet-go | Go `[]struct` | 334 ms | 682 MB | 1.7 M | |
+| arrow-go | — | — | — | — | no predicate-pushdown reader |
 
 #### Where we stand on this file
 
-- **We win the deeply-nested full read** — concurrent **77 ms**, ~8× faster than
-  parquet-go. Materializing optional structs, lists-of-structs and nested structs
-  is exactly the row-path work this library is built for.
-- ⚠️ **parquet-go silently drops two list-of-struct fields** (`license`,
-  `additional_entities`) — same root cause as dbpedia: their list elements aren't
-  named the spec-default `element`, so `GenericReader` returns empty. We resolve
-  them structurally and decode them.
+- **We win the deeply-nested full read** — concurrent **77 ms**, ~10× faster than
+  parquet-go (single-core 505 ms is still ~1.5× ahead), ~13× DuckDB and ~32× arrow-go.
+  Materializing optional structs, lists-of-structs and nested structs is exactly the
+  row-path work this library is built for. arrow-go reads all 65 leaf columns into
+  columnar Arrow (8.1 GB) without ever building Go rows; DuckDB returns nested fields
+  boxed as `map`/`[]interface{}`.
+- **Lists need no special tag with this library.** We declare `License []SWLicense`
+  / `AdditionalEntities []SWAddEntity` and read them. **parquet-go needs the `,list`
+  tag on every list field** (`license,list`, `additional_entities,list`, and the
+  inner `aspects,list`/`groups,list`); with bare `[]T` it silently returns empty
+  lists — no error. The 770 ms above is the fair run *with* those tags, so both
+  readers decode the same data.
 - **Scalar projection** drops back to the columnar fast path: fastest, ahead of
   DuckDB and ~8× ahead of parquet-go.
-- **Selective string filter is our weak spot, and we show it.** `name < "A"` is a
-  *string* range predicate, which our columnar late-materialization doesn't cover
-  (it's gated to numeric/null-free leaves), so we fall back to the row path and scan
-  every row → **126 ms**. DuckDB prunes row groups, stays columnar, and materializes
-  only the 79 k matches → **35 ms**. We still beat parquet-go ~2.5×, but here a query
-  engine is the right tool — exactly the boundary called out below.
+- **The string filter flips with concurrency.** `name < "A"` is a *string* range our
+  columnar late-materialization doesn't cover (it's gated to numeric/null-free
+  leaves), so single-core we fall to the row path and scan every row → 129 ms, behind
+  DuckDB's 38 ms pushdown. But the row-path filter **parallelizes across row groups**:
+  `WithConcurrency` brings it to **21 ms — ahead of DuckDB** (which keeps the lower
+  memory: 41 MB vs our 95 MB, since it materializes only the matches).
 
 ---
 
@@ -481,9 +534,12 @@ fallback otherwise · `reflect` = reflect on the hot path.
 | `[]Struct` | fast path | `RegisterStructList[T]` |
 | `map[K]V` primitive, `map[K]Struct`, `map[K]time.Time`, `map[K1]map[K2]V` | inline / fast path / reflect | K ∈ {string, int32, int64, float64} |
 
-The list element is resolved structurally, so files whose element is named `item`
-or `array` (parquet-cpp, some Spark/Presto output) decode correctly — where
-parquet-go's `GenericReader` silently returns empty lists.
+List columns are resolved **structurally** from the schema tree, so a plain `[]T`
+field reads any standard 3-level `LIST` regardless of how the repeated/element
+levels are named (`element`, `item`, `array` — parquet-cpp, Spark, PyArrow, …).
+parquet-go's `GenericReader` instead requires an explicit `,list` struct tag to bind
+a 3-level list; without it a bare `[]T` maps to a 2-level repeated group and silently
+returns empty lists (no error).
 
 **Not supported (errors at `Compile`):** `[]*Struct`, and mixed two-level nesting
 without a struct boundary (`map[K][]V`, `[]map[K]V`, `map[K1]map[K2]Struct`). Wrap

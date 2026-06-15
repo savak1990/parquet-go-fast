@@ -27,6 +27,17 @@ type WikiEmbedding struct {
 	Emb   []float64 `parquet:"openai"`
 }
 
+// WikiEmbeddingPG is the fair parquet-go variant: identical fields, but the
+// embedding carries the ,list tag that parquet-go requires to bind a 3-level
+// LIST column. With a bare []float64 (as in WikiEmbedding) parquet-go silently
+// returns an empty slice — no error. Our library reads either form unchanged.
+type WikiEmbeddingPG struct {
+	ID    string    `parquet:"_id"`
+	Title string    `parquet:"title"`
+	Text  string    `parquet:"text"`
+	Emb   []float64 `parquet:"openai,list"`
+}
+
 // WikiMeta is the scalar-only projection (no embedding → columnar fast path).
 type WikiMeta struct {
 	ID    string `parquet:"_id"`
@@ -84,7 +95,29 @@ func BenchmarkWikiFull_OursConcurrent(b *testing.B) {
 	reportRows(b, total)
 }
 
-func BenchmarkWikiFull_ParquetGo(b *testing.B) { benchParquetGo[WikiEmbedding](b, readDbpedia(b)) }
+func BenchmarkWikiFull_ParquetGo(b *testing.B) { benchParquetGo[WikiEmbeddingPG](b, readDbpedia(b)) }
+
+func BenchmarkWikiProj_OursConcurrent(b *testing.B) { benchOursConc[WikiMeta](b, readDbpedia(b)) }
+
+func BenchmarkWikiFilter_OursConcurrent(b *testing.B) {
+	data := readDbpedia(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	var matched int
+	for b.Loop() {
+		rows, err := parquetfast.UnmarshalBytes[WikiMeta](data,
+			parquetfast.Where(parquetfast.Col("title").Less(dbpediaFilterTitle)),
+			parquetfast.WithConcurrency(0))
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		matched = len(rows)
+	}
+
+	b.ReportMetric(float64(matched), "matched")
+}
 
 func BenchmarkWikiFull_ArrowGoRows(b *testing.B) {
 	data := readDbpedia(b)
@@ -238,7 +271,7 @@ func duckWikiFull(tb testing.TB, db *sql.DB) int {
 	}
 	defer func() { _ = rows.Close() }()
 
-	out := make([]WikiEmbedding, 0, 60000)
+	out := make([]embRow, 0, 60000)
 
 	var (
 		id, title, text sql.NullString
@@ -250,11 +283,21 @@ func duckWikiFull(tb testing.TB, db *sql.DB) int {
 			tb.Fatal(err)
 		}
 
-		emb := toFloat64s(embRaw)
-		out = append(out, WikiEmbedding{ID: id.String, Title: title.String, Text: text.String, Emb: emb})
+		// DuckDB's database/sql driver yields the LIST<DOUBLE> as a boxed
+		// []interface{} of float64. We keep it as-is — converting it to a real
+		// []float64 would be extra work no other reader's number includes — and
+		// just hold the boxed value (the "Returns" column reflects this).
+		out = append(out, embRow{ID: id.String, Title: title.String, Text: text.String, Emb: embRaw})
 	}
 
 	return len(out)
+}
+
+// embRow mirrors WikiEmbedding but holds the embedding as the boxed []interface{}
+// DuckDB's driver returns (no conversion to []float64).
+type embRow struct {
+	ID, Title, Text string
+	Emb             any
 }
 
 func duckWikiMeta(tb testing.TB, db *sql.DB, where string) []WikiMeta {
@@ -277,24 +320,6 @@ func duckWikiMeta(tb testing.TB, db *sql.DB, where string) []WikiMeta {
 		}
 
 		out = append(out, WikiMeta{ID: id.String, Title: title.String})
-	}
-
-	return out
-}
-
-// toFloat64s converts the []interface{} that go-duckdb yields for a LIST<DOUBLE>
-// column into []float64 (the real cost of getting a list into Go via the driver).
-func toFloat64s(v any) []float64 {
-	s, ok := v.([]interface{})
-	if !ok {
-		return nil
-	}
-
-	out := make([]float64, len(s))
-	for i, x := range s {
-		if f, ok := x.(float64); ok {
-			out[i] = f
-		}
 	}
 
 	return out

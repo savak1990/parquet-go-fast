@@ -111,6 +111,8 @@ func BenchmarkOrcaFull_DuckDB(b *testing.B) {
 
 func BenchmarkOrcaProj_Ours(b *testing.B) { benchOurs[OpenOrca2](b, readOrca(b)) }
 
+func BenchmarkOrcaProj_OursConcurrent(b *testing.B) { benchOursConc[OpenOrca2](b, readOrca(b)) }
+
 func BenchmarkOrcaProj_ParquetGo(b *testing.B) { benchParquetGo[OpenOrca2](b, readOrca(b)) }
 
 func BenchmarkOrcaProj_ArrowGoRows(b *testing.B) {
@@ -149,6 +151,26 @@ func BenchmarkOrcaFilter_Ours(b *testing.B) {
 	for b.Loop() {
 		rows, err := parquetfast.UnmarshalBytes[OpenOrca2](data,
 			parquetfast.Where(parquetfast.Col("system_prompt").Equal(orcaFilterPrompt)))
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		matched = len(rows)
+	}
+
+	b.ReportMetric(float64(matched), "matched")
+}
+
+func BenchmarkOrcaFilter_OursConcurrent(b *testing.B) {
+	data := readOrca(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	var matched int
+	for b.Loop() {
+		rows, err := parquetfast.UnmarshalBytes[OpenOrca2](data,
+			parquetfast.Where(parquetfast.Col("system_prompt").Equal(orcaFilterPrompt)),
+			parquetfast.WithConcurrency(0))
 		if err != nil {
 			b.Fatal(err)
 		}
