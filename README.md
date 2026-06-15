@@ -373,7 +373,8 @@ reflect fallback otherwise · `reflect` = reflect on the hot path ·
 | `struct{…}` | typed inline | embedded at parent offset |
 | `*struct{…}` | typed fast path | `RegisterStructAlloc[T]`, else `reflect.New` |
 | **Primitive slices** | | |
-| `[]string, []bool, []int…, []uint16/32/64, []float…` | typed inline | both `repeated` and `,list` layouts |
+| `[]string, []bool, []int…, []uint16/32/64, []float…` | typed inline | required elements; both `repeated` and `,list` layouts |
+| `[]*string, []*bool, []*int…, []*float…` | typed inline | **nullable elements**: null → nil, positions preserved |
 | `[]time.Time` | typed inline | TIMESTAMP/DATE elements |
 | **Struct slices** | | |
 | `[]Struct` | typed fast path | `RegisterStructList[T]`, else `reflect.MakeSlice` |
@@ -384,11 +385,18 @@ reflect fallback otherwise · `reflect` = reflect on the hot path ·
 | **Maps — `map[K]time.Time`** | reflect | time value is a single leaf |
 | **Nested maps — `map[K1]map[K2]V`** | reflect | inner V primitive |
 
+> **List elements & producer compatibility.** `[]T` drops null elements; use
+> `[]*T` to keep them (null → nil, positions preserved). The list element node is
+> resolved *structurally*, so files whose element is named `item`/`array`
+> (parquet-cpp and some Spark/Presto output) decode correctly — parquet-go's own
+> `GenericReader` assumes the spec-default name `element` and silently returns
+> empty lists for those files.
+
 ### Not supported (errors at `Compile`)
 
 | Go field type | Why | Use instead |
 |---|---|---|
-| `[]*T` | pointer-element slices | `[]T` |
+| `[]*Struct` | pointer-element struct slices | `[]Struct` |
 | `map[K][]V` | mixed nesting: two repetition levels with no struct dispatch boundary | `map[K]struct{ Items []V }` |
 | `[]map[K]V` | same | `[]struct{ M map[K]V }` |
 | `map[K][]Struct` | same | `map[K]struct{ Items []Struct }` |
@@ -596,15 +604,32 @@ The suite encodes with `parquet-go`'s `GenericWriter` and decodes back with this
 library (`reflect.DeepEqual` gate), covering every supported shape in isolation
 plus two production-shaped records from an unrelated domain (e-commerce /
 logistics rollups: a wide record with a high-cardinality struct-valued map, a
-nested map, a struct slice, optional struct chains, and `[]byte` blobs). Two
-scale tests generate **one-million-row, multi-row-group files** on disk and
-stream-decode them end to end, checking order-independent aggregates so a
-dropped, duplicated, or corrupted row is caught without holding every row in
-memory. All fixtures are synthetic.
+nested map, a struct slice, optional struct chains, and `[]byte` blobs). Scale
+tests generate **multi-row-group files** on disk (a one-million-row concurrent
+soak plus 250k-row streaming runs) and stream-decode them end to end, checking
+order-independent aggregates so a dropped, duplicated, or corrupted row is caught
+without holding every row in memory. All fixtures are synthetic.
 
 ```sh
-go test ./...            # full suite, incl. the million-row scale tests
-go test -short ./...     # skips the million-row tests
+go test ./...            # full suite, incl. the scale tests
+go test -short ./...     # skips the scale tests (sub-second)
+```
+
+### Conformance (Apache spec corpus)
+
+Beyond the synthetic suite, the library is checked against
+[apache/parquet-testing](https://github.com/apache/parquet-testing) — golden
+files written by parquet-mr/Java, parquet-cpp, parquet-rs, Impala, Spark and
+Presto, exercising encodings and edge cases our own writer never emits
+(DELTA\_\*, BYTE\_STREAM\_SPLIT, RLE\_DICTIONARY, Float16, INT96, decimals,
+LZ4/brotli, legacy 2-level lists, maps without required keys, null pages, …).
+Every file the reference reader can open decodes with a matching row count, and a
+curated set is compared value-for-value against `parquet-go`'s reference reader.
+The corpus is not vendored; point `PARQUET_TESTING_DIR` at a checkout:
+
+```sh
+git clone https://github.com/apache/parquet-testing
+PARQUET_TESTING_DIR=parquet-testing/data go test -run TestConformance ./...
 ```
 
 ## License

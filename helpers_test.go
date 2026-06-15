@@ -32,3 +32,6 @@ func (c *instrumentedReaderAt) ReadAt(p []byte, off int64) (int, error) {
 
 	return n, err
 }
+
+// ptr returns a pointer to v — for building optional/nullable test values.
+func ptr[T any](v T) *T { return &v }

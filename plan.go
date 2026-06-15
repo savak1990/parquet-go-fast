@@ -309,6 +309,13 @@ func addFieldByKind(plan *Plan, ft reflect.Type, offset uintptr, path []string, 
 			return addPrimitiveList(plan, ft, offset, path, schema)
 		}
 
+		// []*scalar — a list with nullable elements (positions preserved).
+		if elem.Kind() == reflect.Ptr {
+			if _, ok := scalarKindFor(elem.Elem().Kind()); ok {
+				return addOptionalPrimitiveList(plan, ft, offset, path, schema)
+			}
+		}
+
 		return unsupportedKindErr(ft, path)
 	case reflect.Map:
 		return addMapField(plan, ft, offset, path, schema)
