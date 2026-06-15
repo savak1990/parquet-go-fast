@@ -141,8 +141,9 @@ Allocations stay in the **hundreds** for parquet-go-fast across all widths
   other Go option. Closing this needs late materialization (not yet implemented).
 
 **Net:** for materializing parquet into Go row structs we are the fastest measured
-option (full) or a close second (projection); for selective analytical queries,
-purpose-built engines are the right tool and we don't pretend to compete.
+option — at full reads *and* projection, ahead of even arrow-go's columnar reader;
+for selective analytical queries, purpose-built engines are the right tool and we
+don't pretend to compete.
 
 ## Fairness notes / caveats
 
