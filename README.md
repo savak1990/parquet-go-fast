@@ -19,17 +19,26 @@ writes — no per-row reflection.
 
 ## Performance
 
-Measured on the real
-[NYC TLC yellow-taxi file](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page)
-(2.96 M rows × 19 mixed columns; warm cache; Apple M4 Pro, Go 1.26), against the
-other Go readers and query engines — each materializing into a **ready-to-use
-native row collection**. Reproduce and read the methodology in [`bench/`](bench/).
+Benchmarks live in [`bench/`](bench/) (full methodology + reproduction). Each
+reader is measured end to end into a **ready-to-use native row collection**, and
+compared *within category* — full materialization vs columnar decode vs analytical
+query are different amounts of work, so they're never mixed. Apple M4 Pro, Go 1.26.
 
 > **What each reader hands back matters.** Only parquet-go-fast and parquet-go
 > return an idiomatic Go `[]struct` directly. **arrow-go** returns *columnar Arrow
-> arrays* — its "→ rows" numbers below include the column→struct transpose you'd
+> arrays* — its "→ rows" numbers include the column→struct transpose you'd
 > otherwise write yourself. **DuckDB→Go** goes through `database/sql` (per-cell
 > `Scan`); **PyArrow** is a different runtime (Python objects).
+
+### NYC TLC yellow-taxi — flat, columnar-friendly analytical file
+
+[NYC TLC yellow-taxi](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page),
+2.96 M rows × 19 columns, warm cache. This is a **clean, idiomatic,
+columnar-friendly analytical file** — flat scalar columns (no maps, lists, or
+optional structs), dictionary-encoded, zstd-compressed. It is the shape parquet is
+best suited for, and the favorable case for any columnar reader (this library
+included): nested/map-heavy schemas decode through the slower row path and are a
+separate story (see [Architecture](#architecture)).
 
 **Full read — all 19 columns → rows.** Read every row and column into records.
 The Go readers and DuckDB→Go return a `[]struct`; arrow-go returns columnar Arrow
@@ -63,7 +72,7 @@ parquet-go-fast is shown single-core and with `WithConcurrency`.
 | `trip_distance > 50` (412) | 44 ms | **17 ms** | 9 ms | ~9 ms | 1971 ms |
 | `fare_amount > 100` (7 995) | 43 ms | **17 ms** | 12 ms | ~14 ms | 1968 ms |
 
-### Where we stand — honestly
+#### Where we stand on this file
 
 - ✅ **Fastest way to get Go structs out of parquet.** We win full reads — 1.7×
   faster than arrow-go's columnar read, which doesn't even build structs — and
