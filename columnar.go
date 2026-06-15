@@ -104,7 +104,14 @@ func applyColumn(chunk parquet.ColumnChunk, s *scalarSetter, base0 unsafe.Pointe
 			return perr
 		}
 
-		rerr := applyPageValues(pg.Values(), s, base0, elemSize, rowBase, n, &row, batch)
+		// Tier 2: decode numeric columns straight from the typed buffer (no
+		// parquet.Value boxing). Falls back to the boxed reader for kinds /
+		// encodings it doesn't handle (strings, bools, time, optionals, …).
+		var rerr error
+		if !applyTypedPage(pg, s, base0, elemSize, rowBase, n, &row) {
+			rerr = applyPageValues(pg.Values(), s, base0, elemSize, rowBase, n, &row, batch)
+		}
+
 		parquet.Release(pg)
 
 		if rerr != nil {

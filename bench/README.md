@@ -97,9 +97,9 @@ Numbers move with hardware; the **ratios** are the takeaway. All Go rows end in 
 
 | Tool | Output | Time | allocs/op |
 |---|---|---:|---:|
-| **parquet-go-fast (concurrent)** | Go rows | **269 ms** | 1.8 K |
-| arrow-go | Arrow (columnar) | 308 ms | 193 K |
-| parquet-go-fast (single) | Go rows | 740 ms | 1.8 K |
+| **parquet-go-fast (concurrent)** | Go rows | **173 ms** | 1.6 K |
+| arrow-go | Arrow (columnar) | 298 ms | 193 K |
+| parquet-go-fast (single) | Go rows | 439 ms | 1.6 K |
 | DuckDB → Go | Go rows | 2103 ms | 42 M |
 | parquet-go `GenericReader` | Go rows | 3048 ms | 24 M |
 
@@ -107,9 +107,9 @@ Numbers move with hardware; the **ratios** are the takeaway. All Go rows end in 
 
 | Columns | parquet-go-fast | arrow-go → rows | DuckDB → Go | parquet-go |
 |---|---:|---:|---:|---:|
-| 1 | 24 ms | **17 ms** | 133 ms | 1896 ms |
-| 5 | 121 ms | **82 ms** | 498 ms | 2010 ms |
-| 10 | 239 ms | **184 ms** | 922 ms | 2290 ms |
+| 1 | **10 ms** | 17 ms | 133 ms | 1896 ms |
+| 5 | **47 ms** | 82 ms | 498 ms | 2010 ms |
+| 10 | **98 ms** | 184 ms | 922 ms | 2290 ms |
 
 Allocations stay in the **hundreds** for parquet-go-fast across all widths
 (arrow-go: 7.5 K–110 K; DuckDB: 2.9 M–11.6 M; parquet-go: 17.8 M).
@@ -118,20 +118,21 @@ Allocations stay in the **hundreds** for parquet-go-fast across all widths
 
 | Predicate (matches) | parquet-go-fast | DuckDB → Go | PyArrow | parquet-go |
 |---|---:|---:|---:|---:|
-| `trip_distance > 50` (412) | 465 ms | **9 ms** | ~8 ms | 2002 ms |
-| `fare_amount > 100` (7 995) | 463 ms | **12 ms** | — | 2005 ms |
+| `trip_distance > 50` (412) | 461 ms | **9 ms** | ~9 ms | 2002 ms |
+| `fare_amount > 100` (7 995) | 459 ms | **12 ms** | ~14 ms | 2005 ms |
 
 (PyArrow row count materialized via dataset pushdown + `to_pylist`.)
 
 ## How to read it
 
 - **Full materialization → Go structs: parquet-go-fast wins.** The concurrent
-  read even beats arrow-go's columnar read while returning usable structs, and
-  it does so with ~4 orders of magnitude fewer allocations than the engine paths.
-- **Projection → Go structs: arrow-go leads by ~1.3–1.5×.** Its columnar reader
-  avoids the `parquet.Value` boxing we still pay; we're a clear second and
-  4–5× ahead of DuckDB→Go. (Eliminating that boxing — a typed dictionary gather
-  — is the planned "Tier 2" optimization.)
+  read is ~1.7× faster than arrow-go's columnar read while returning usable
+  structs, with ~4 orders of magnitude fewer allocations than the engine paths.
+- **Projection → Go structs: parquet-go-fast leads at every width** (~1.7–1.8×
+  faster than arrow-go→rows; 4–10× faster than DuckDB→Go). The Tier 2 columnar
+  decode reads numeric columns straight from the page's typed buffer (a typed
+  dictionary gather, no `parquet.Value` boxing), and writes directly into structs
+  — arrow-go pays an extra columnar-arrays→structs transpose we don't.
 - **Selective filter → rows: the engines win by ~50×, and we say so.** DuckDB and
   PyArrow decode only the filter column, locate matches, then fetch other columns
   *only for matched rows* (late materialization). We prune row groups/pages by
