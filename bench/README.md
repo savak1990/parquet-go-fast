@@ -39,12 +39,17 @@ Each dataset gets the same three workloads, across different shapes:
 - **dbpedia embeddings** ([HF KShivendu/dbpedia-entities-openai-1M](https://huggingface.co/datasets/KShivendu/dbpedia-entities-openai-1M))
   — **38,462 rows × 3 strings + a 1536-dim `LIST<double>` embedding** (~350 MB).
   Nested — the list forces the row path; projecting it away returns to columnar.
+- **structured-wikipedia** ([HF wikimedia/structured-wikipedia](https://huggingface.co/datasets/wikimedia/structured-wikipedia),
+  `enwiki_namespace_0`) — **177,499 rows**, deeply nested (~354 MB): optional structs,
+  lists-of-structs, `list<string>`, struct-in-struct. The least parquet-idiomatic
+  shape — closest to a real application data model; the full read is all row path.
 
 ```sh
-./download.sh         # NYC taxi (~48 MB)  → bench/data/yellow_tripdata_2024-01.parquet
-./download.sh orca    # Open-Orca (~1 GB)  → bench/data/openorca.parquet
-./download.sh dbpedia # dbpedia (~350 MB)  → bench/data/dbpedia.parquet
-./download.sh all     # everything
+./download.sh            # NYC taxi (~48 MB)  → bench/data/yellow_tripdata_2024-01.parquet
+./download.sh orca       # Open-Orca (~1 GB)  → bench/data/openorca.parquet
+./download.sh dbpedia    # dbpedia (~350 MB)  → bench/data/dbpedia.parquet
+./download.sh structwiki # structured-wikipedia (~354 MB) → bench/data/structwiki.parquet
+./download.sh all        # everything
 ```
 
 ## Workloads
@@ -75,6 +80,8 @@ go test -bench 'BenchmarkFull_'  -benchmem -benchtime=5x -run '^$'   # workload 
 go test -bench 'BenchmarkProj_'  -benchmem -benchtime=5x -run '^$'   # workload 2 (sub-benchmarks 01col/05col/10col)
 go test -bench 'BenchmarkFilter_' -benchmem -benchtime=5x -run '^$'  # workload 3 (sub-benchmarks per predicate)
 go test -bench 'Orca'             -benchmem -benchtime=3x -run '^$'  # Open-Orca suite (set ORCA_FILE or ./download.sh orca)
+go test -bench 'Wiki'             -benchmem -benchtime=5x -run '^$'  # dbpedia suite (set DBPEDIA_FILE or ./download.sh dbpedia)
+go test -bench 'SW'               -benchmem -benchtime=3x -run '^$'  # structured-wikipedia suite (set STRUCTWIKI_FILE or ./download.sh structwiki)
 go test -run TestFilterCountDiagnostic -v                            # sanity: pushdown count == engines
 ```
 
@@ -209,6 +216,33 @@ row path on the full read; the projection drops it (columnar path).
   element structurally and read it correctly; parquet-go's ~23 ms decodes nothing
   for that column (a correctness failure, not a speed win).
 - Projection (drop the list) and string filter both go our way.
+
+## Results — structured-wikipedia (deeply nested; `-benchtime=3x`)
+
+177,499 enwiki rows: optional structs, lists-of-structs, `list<string>`,
+struct-in-struct. The full read is all row path; the scalar projection drops back to
+columnar; the *string* filter is our weak spot (no columnar late-mat for strings).
+arrow-go/PyArrow omitted — a hand-written nested→Go transpose this deep isn't a fair
+column read.
+
+| Workload | parquet-go-fast | DuckDB → Go | parquet-go |
+|---|---:|---:|---:|
+| Full (every nested field) | 490 / **77** (conc) ms | — | ⚠️ 597 ms (drops 2 lists) |
+| Projection (id+name+url) | **41 ms** | 62 ms | 320 ms |
+| Filter (`name<"A"`, 79 003) | 126 ms | **35 ms** | 320 ms |
+
+- **We win the deeply-nested full read** (concurrent 77 ms, ~8× faster than
+  parquet-go) — materializing optional/nested structs and lists-of-structs is the
+  row-path work this library exists for.
+- ⚠️ **parquet-go silently drops `license` + `additional_entities`** (empty lists) —
+  same cause as dbpedia: their list elements aren't named the spec-default `element`.
+  We resolve them structurally and decode them.
+- **Scalar projection** returns to the columnar path: fastest, ~8× ahead of parquet-go.
+- **Selective string filter is our loss, shown honestly.** `name < "A"` is a string
+  range our columnar late-materialization doesn't cover (gated to numeric/null-free
+  leaves), so we fall to the row path and scan everything → 126 ms. DuckDB prunes,
+  stays columnar, materializes only the matches → 35 ms. We still beat parquet-go
+  ~2.5×, but a query engine is the right tool for this one.
 
 ## Fairness notes / caveats
 

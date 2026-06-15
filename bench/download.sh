@@ -4,8 +4,9 @@
 #   NYC TLC yellow-taxi  — flat numeric,        ~48 MB  (https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page)
 #   Open-Orca (HF)       — string-heavy,         ~1 GB   (https://huggingface.co/datasets/Open-Orca/OpenOrca)
 #   dbpedia (HF)         — nested list + strings, ~350 MB (https://huggingface.co/datasets/KShivendu/dbpedia-entities-openai-1M)
+#   structwiki (HF)      — deeply nested structs, ~354 MB (https://huggingface.co/datasets/wikimedia/structured-wikipedia)
 #
-# Usage: ./download.sh [taxi|orca|dbpedia|all]   (default: taxi)
+# Usage: ./download.sh [taxi|orca|dbpedia|structwiki|all]   (default: taxi)
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p data
@@ -38,4 +39,11 @@ if [ "$what" = "dbpedia" ] || [ "$what" = "all" ]; then
 	# ~350 MB; 3 strings + a 1536-dim LIST<double> embedding (nested).
 	fetch "https://huggingface.co/datasets/KShivendu/dbpedia-entities-openai-1M/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet" \
 		"data/dbpedia.parquet"
+fi
+
+if [ "$what" = "structwiki" ] || [ "$what" = "all" ]; then
+	# ~354 MB; deeply nested — optional structs, lists-of-structs, list<string>,
+	# struct-in-struct (177,499 enwiki articles).
+	fetch "https://huggingface.co/datasets/wikimedia/structured-wikipedia/resolve/refs%2Fconvert%2Fparquet/enwiki_namespace_0/train/0000.parquet" \
+		"data/structwiki.parquet"
 fi

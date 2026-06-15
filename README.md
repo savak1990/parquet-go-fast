@@ -245,6 +245,78 @@ type WikiEmbedding struct {
 
 ---
 
+### structured-wikipedia — deeply nested, application-shaped (HuggingFace)
+
+[wikimedia/structured-wikipedia](https://huggingface.co/datasets/wikimedia/structured-wikipedia),
+177,499 rows (~354 MB). The **least** parquet-idiomatic file here and the closest to
+a real application data model: optional structs, lists-of-structs, a `list<string>`,
+and a struct-nested-in-a-struct. Nothing about this is columnar-friendly — the full
+read is *all* row path. (arrow-go/PyArrow are omitted: a hand-written nested→Go
+transpose for a schema this deep is bespoke and fragile, not a fair apples-to-apples
+column read.)
+
+```go
+type Article struct {
+    Identifier  int64     `parquet:"identifier"`
+    Name        string    `parquet:"name"`
+    Abstract    string    `parquet:"abstract"`
+    URL         string    `parquet:"url"`
+    DateCreated time.Time `parquet:"date_created"`
+
+    Image      *SWImage  `parquet:"image"`       // optional struct
+    MainEntity *SWEntity `parquet:"main_entity"` // optional struct
+
+    AdditionalEntities []SWAddEntity `parquet:"additional_entities"` // list<struct{ list<string>, … }>
+    License            []SWLicense   `parquet:"license"`             // list<struct>
+
+    Version *SWVersion `parquet:"version"` // struct → *SWEditor (struct-in-struct)
+}
+```
+
+**Full read — every nested field → rows**
+
+| Reader | Time | Note |
+|---|---:|---|
+| **parquet-go-fast** (concurrent) | **77 ms** | ✅ |
+| parquet-go-fast (single core) | 490 ms | ✅ |
+| parquet-go | 597 ms | ⚠️ **drops `license` + `additional_entities` (empty lists)** |
+
+**Projection — `identifier` + `name` + `url` (scalar → columnar) → rows**
+
+| Reader | Time |
+|---|---:|
+| **parquet-go-fast** | 41 ms |
+| DuckDB → Go | 62 ms |
+| parquet-go | 320 ms |
+
+**Filter — `name < "A"` (79 003 matches) → rows**
+
+| Reader | Time |
+|---|---:|
+| **DuckDB → Go** | 35 ms |
+| parquet-go-fast | 126 ms |
+| parquet-go | 320 ms |
+
+#### Where we stand on this file
+
+- **We win the deeply-nested full read** — concurrent **77 ms**, ~8× faster than
+  parquet-go. Materializing optional structs, lists-of-structs and nested structs
+  is exactly the row-path work this library is built for.
+- ⚠️ **parquet-go silently drops two list-of-struct fields** (`license`,
+  `additional_entities`) — same root cause as dbpedia: their list elements aren't
+  named the spec-default `element`, so `GenericReader` returns empty. We resolve
+  them structurally and decode them.
+- **Scalar projection** drops back to the columnar fast path: fastest, ahead of
+  DuckDB and ~8× ahead of parquet-go.
+- **Selective string filter is our weak spot, and we show it.** `name < "A"` is a
+  *string* range predicate, which our columnar late-materialization doesn't cover
+  (it's gated to numeric/null-free leaves), so we fall back to the row path and scan
+  every row → **126 ms**. DuckDB prunes row groups, stays columnar, and materializes
+  only the 79 k matches → **35 ms**. We still beat parquet-go ~2.5×, but here a query
+  engine is the right tool — exactly the boundary called out below.
+
+---
+
 **Use parquet-go-fast** when your Go code needs rows as typed structs (ETL, event
 replay, feeding services). **Reach for a query engine** (DuckDB, ClickHouse) for
 selective analytical queries where you never need the rows materialized in Go.
