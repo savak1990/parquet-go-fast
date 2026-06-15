@@ -14,8 +14,8 @@ produce **different things**:
 
 | Category | What you get | Tools here |
 |---|---|---|
-| **A. Row materialization** | `N` native row objects (Go `[]struct`, Python list of dicts) | parquet-go-fast, parquet-go, DuckDB→Go, PyArrow `to_pylist` |
-| **B. Columnar decode** | column arrays, *no per-row objects* | arrow-go, PyArrow `read_table` |
+| **A. Row materialization** | `N` native row objects (Go `[]struct`) | parquet-go-fast, parquet-go, DuckDB→Go |
+| **B. Columnar decode** | column arrays, *no per-row objects* | arrow-go |
 | **C. Analytical query** | a scalar / aggregate; rows never leave the engine | DuckDB / ClickHouse `SELECT sum(...)` |
 
 Comparing "build 2.96 M structs" (A) to "compute one `SUM` and discard the data"
@@ -97,18 +97,6 @@ The first run compiles the DuckDB cgo library (slow); subsequent runs are fast.
 `reportRows` adds a `rows/s` metric; filter benchmarks add a `matched` count
 instead (output rows/s is meaningless when almost everything is filtered out).
 
-### PyArrow (Python row materialization, separate runtime)
-
-```sh
-pip install pyarrow
-python3 sql/pyarrow_bench.py
-```
-
-`read_table` is columnar (category B); `.to_pylist()` is the row-materialization
-equivalent (category A). Different runtime than Go — read it for the
-columnar-vs-rows gap and the filter-pushdown speed, not for a head-to-head ns
-count against Go.
-
 ### DuckDB / ClickHouse analytical (category C, context only)
 
 ```sh
@@ -147,14 +135,13 @@ parquet-go: 17.8 M).
 
 ### 3. Filter (predicate → matching rows)
 
-| Predicate (matches) | parquet-go-fast | …concurrent | DuckDB → Go | PyArrow | parquet-go |
-|---|---:|---:|---:|---:|---:|
-| `trip_distance > 50` (412) | 43 ms | **16 ms** | 8.8 ms | ~9 ms | 1995 ms |
-| `fare_amount > 100` (7 995) | 43 ms | 17 ms | **12 ms** | ~14 ms | 1986 ms |
+| Predicate (matches) | parquet-go-fast | …concurrent | DuckDB → Go | parquet-go |
+|---|---:|---:|---:|---:|
+| `trip_distance > 50` (412) | 43 ms | **16 ms** | 8.8 ms | 1995 ms |
+| `fare_amount > 100` (7 995) | 43 ms | 17 ms | **12 ms** | 1986 ms |
 
-(PyArrow row count materialized via dataset pushdown + `to_pylist`; arrow-go has no
-predicate-pushdown reader. DuckDB filter Go-heap mem is tiny — 47 KB / 1.2 MB — since
-it materializes only the matches.)
+(arrow-go has no predicate-pushdown reader. DuckDB filter Go-heap mem is tiny —
+47 KB / 1.2 MB — since it materializes only the matches.)
 
 ## How to read it
 
@@ -275,8 +262,6 @@ table columnar (no row transpose); DuckDB returns nested fields boxed.
   goroutine. DuckDB parallelizes its scan, but its `database/sql` `Scan` into Go
   (the row materialization) is single-threaded and dominates its time — those
   42 M allocs are the driver boxing every cell.
-- **PyArrow is CPython** — a different runtime; treat its numbers as
-  cross-ecosystem context, not a same-VM head-to-head.
 - **Selectivity matters.** These predicates scatter across the file. A predicate
   aligned with row-group/page ordering (e.g. a range on a clustered/sorted
   column) lets parquet-go-fast's pruning skip most of the file — a case where the

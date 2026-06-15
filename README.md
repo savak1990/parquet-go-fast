@@ -11,9 +11,15 @@ import parquetfast "github.com/savak1990/parquet-go-fast"
 rows, err := parquetfast.UnmarshalFile[MyRow]("data.parquet") // []MyRow
 ```
 
+**Who it's for.** Reach for it when your Go code needs parquet as native typed rows
+to *operate on* — ETL and data enrichment, joining or augmenting row-structured
+records, event/log replay, backfills, or feeding rows into a Go service — rather than
+running analytical queries over the file (use a query engine like DuckDB for that).
+It's pure Go on the hot path (no cgo, no Arrow runtime), so it drops into any Go binary.
+
 It is **decode-only**, depends only on `parquet-go` (no fork, no `replace`), and
 reads files written by any spec-conformant writer (parquet-go, Arrow, Spark,
-DuckDB, pandas/pyarrow, …). It compiles the `(Go type, file schema)` mapping
+DuckDB, pandas, …). It compiles the `(Go type, file schema)` mapping
 **once** and then decodes every row through precompiled, typed `unsafe.Pointer`
 writes — no per-row reflection.
 
@@ -32,16 +38,13 @@ query are different amounts of work, so they're never mixed. Apple M4 Pro, Go 1.
 | parquet-go | [`parquet-go/parquet-go`](https://github.com/parquet-go/parquet-go) `GenericReader` (reflection) | Go `[]struct` |
 | arrow-go | [`apache/arrow-go`](https://github.com/apache/arrow-go) `pqarrow` — pure-Go **columnar** read + our transpose to rows | Arrow arrays → `[]struct`\* |
 | DuckDB → Go | [`marcboeker/go-duckdb`](https://github.com/marcboeker/go-duckdb) (cgo) over `database/sql` — `Scan` into structs | Go `[]struct` |
-| PyArrow | Python [`pyarrow`](https://arrow.apache.org/docs/python/) — `read_table` (columnar) / `to_pylist` (rows) | Arrow / Python list |
 
 \* Only parquet-go-fast and parquet-go return a Go `[]struct` natively. **arrow-go
 returns columnar Arrow arrays** — the "→ rows" numbers are *our* transpose on top,
 and for string columns those values alias Arrow's buffer (views), not independent
 Go strings (which is why its allocation counts look so low). **DuckDB → Go** is the
 real in-process cgo driver going through `database/sql` (the per-cell `Scan` is the
-bulk of its allocations) — not the CLI. **PyArrow** is a different runtime (Python);
-it lives in the [`bench/sql`](bench/sql) scripts for cross-ecosystem context and is
-not in the Go tables below. The DuckDB/ClickHouse *CLI* appears only in
+bulk of its allocations) — not the CLI. The DuckDB/ClickHouse *CLI* appears only in
 [`bench/sql/engines.sh`](bench/sql/engines.sh) for scalar analytical queries that
 never materialize rows — not in any table here.
 
@@ -282,8 +285,9 @@ type WikiEmbedding struct {
 **least** parquet-idiomatic file here and the closest to a real application data
 model: optional structs, lists-of-structs, a `list<string>`, and a
 struct-nested-in-a-struct. Nothing about this is columnar-friendly — the full read is
-*all* row path. (arrow-go/PyArrow are omitted: a hand-written nested→Go transpose for
-a schema this deep is bespoke and fragile, not a fair apples-to-apples column read.)
+*all* row path. (arrow-go can only read it **columnar** — a hand-written nested→Go row
+transpose this deep is bespoke and fragile — so it appears in the full table as a
+columnar read and is left out of the projection/filter tables.)
 
 The struct below maps a representative subset of the 19 fields — each nested type
 shows the shape (optional struct, list-of-struct, `[]string`, struct-in-struct):
@@ -488,37 +492,51 @@ func init() {
 
 ## Architecture
 
-Decoding is split into two stages so the per-row work carries no reflection.
+The whole design serves one goal: **get bytes from the file into Go struct fields
+with the least possible work per value.**
 
-**Stage 1 — Plan (once per `(Go type, schema)`, cached).** Reflection walks the
-struct and the parquet schema a single time and emits a flat list of scalar
-setters — `{column index, field byte-offset, kind}` — plus a closure per compound
-field (map, list, optional struct). Plans are cached process-wide, keyed on the
-type, schema, and null-column shape.
+**Compile once, then no reflection.** The first decode of a given `(Go type, file
+schema)` walks both with reflection a single time and compiles a **plan**: a flat
+list of scalar *setters* — `{column index, field byte-offset, type kind}` — plus one
+closure per compound field (map, list, optional struct). After that, writing a value
+is a typed `switch` that stores straight to `base + offset` through `unsafe.Pointer`
+— no `reflect.Value`, no interface boxing, no per-field call on the hot path. Plans
+are cached process-wide (keyed on type, schema, and null-column shape), so reflection
+is paid once per process, not once per row.
 
-**Stage 2 — Apply (per row, no reflection).** Each value is written straight to
-`base + offset` through `unsafe.Pointer` and a typed enum-`switch` — no
-`reflect.Value`, no interface dispatch, no per-leaf closure call.
+**Scalar-only schemas take a columnar fast path — this is the speed story.** When the
+struct has no maps, lists, or optional structs, the decoder skips parquet-go's row
+reader (and its row-assembly step) entirely and reads **one column at a time**,
+writing strided into the output structs. Numeric columns go **straight from the
+page's typed buffer** — dictionary indices resolved against the dictionary's typed
+values, nulls placed from the definition levels — with **no `parquet.Value` boxing
+and one typed store per cell**. That is why full reads and projection beat even
+arrow-go's columnar reader: we write directly into the final `[]struct`, whereas a
+columnar reader still has to transpose its arrays into rows afterward.
+Strings/bools/`time.Time`/optionals use a still-columnar but boxed read; any compound
+field drops to the row path below, so nested schemas are simply unaffected.
 
-**Columnar fast path.** For **scalar-only** schemas (no maps/lists/optional
-structs) the decoder skips parquet-go's row reader entirely and reads
-**column-at-a-time**, writing strided into the destination structs. Numeric
-columns decode **straight from the page's typed buffer** — resolving dictionary
-indices against the dictionary's typed values and placing nulls from the
-definition levels, with no `parquet.Value` boxing and one typed store per cell.
-That is what makes full reads and projection beat even arrow-go's columnar path.
-Strings/bools/`time.Time`/optionals fall back to a (still columnar) boxed read;
-any compound field falls back to the row path, so nested schemas are unaffected.
-The whole path composes with concurrency (each worker owns a disjoint output
-region).
+**Nested schemas use the row path.** Maps, lists, and optional structs decode through
+parquet-go's row reader, after which the plan's setters and closures populate the
+struct. List columns are resolved **structurally** from the schema tree, so a plain
+`[]T` reads any spec-conformant 3-level `LIST` no matter how its inner levels are
+named (`element`, `item`, `array`).
 
-On top of the hot path: a process-wide plan cache, all-null-column elision,
-column projection, and predicate pushdown (row-group + page pruning, sorted-column
-binary search, bloom filters). Filtered reads of scalar-only structs use the same
-columnar decode — output columns are decoded once, the predicate is evaluated over
-the decoded values, and only matches are kept — and parallelize across row groups
-with `WithConcurrency`; heavily-pruned scans (sorted columns) fall back to a
-row-at-a-time path that seeks over skipped pages.
+**Concurrency is row-group parallelism.** `WithConcurrency(n)` fans the file's row
+groups across `n` worker goroutines; each decodes whole row groups into a **disjoint
+region** of the pre-allocated `[]T`, so there is no locking and no merge step. Speedup
+therefore scales with the **number of row groups** — a single-row-group file can't be
+split and runs sequentially. It requires a concurrency-safe `io.ReaderAt`;
+`UnmarshalFile` and `UnmarshalBytes` both qualify.
+
+**Skip work before decoding it.** Column projection touches only the bound columns;
+predicate pushdown prunes whole row groups and pages (min/max stats, sorted-column
+binary search, bloom filters) before anything is decoded. A filtered read of a
+scalar-only struct reuses the columnar path: it decodes the output columns once,
+evaluates the predicate over the **already-decoded** values (the filter column is
+never read twice), keeps the matches, and parallelizes across row groups too.
+Heavily-pruned scans on sorted columns instead use a row-at-a-time path that seeks
+over the skipped pages.
 
 ## Supported types
 
@@ -540,7 +558,7 @@ fallback otherwise · `reflect` = reflect on the hot path.
 
 List columns are resolved **structurally** from the schema tree, so a plain `[]T`
 field reads any standard 3-level `LIST` regardless of how the repeated/element
-levels are named (`element`, `item`, `array` — parquet-cpp, Spark, PyArrow, …).
+levels are named (`element`, `item`, `array` — parquet-cpp, Spark, Arrow, …).
 parquet-go's `GenericReader` instead requires an explicit `,list` struct tag to bind
 a 3-level list; without it a bare `[]T` maps to a 2-level repeated group and silently
 returns empty lists (no error).

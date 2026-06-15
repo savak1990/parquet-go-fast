@@ -37,10 +37,10 @@ func allRowGroups(pf *file.Reader) []int {
 	return rgs
 }
 
-// arrow-go (pure Go, no cgo) reads parquet into Arrow *columnar* arrays — the
-// Go-native equivalent of pyarrow read_table. It does not produce row structs;
-// the columnar read is one category (fast, no per-row objects), and transposing
-// Arrow columns into []struct is a separate, row-materialization cost.
+// arrow-go (pure Go, no cgo) reads parquet into Arrow *columnar* arrays. It does
+// not produce row structs; the columnar read is one category (fast, no per-row
+// objects), and transposing Arrow columns into []struct is a separate,
+// row-materialization cost.
 
 func arrowReadTableColumnar(tb testing.TB, data []byte) int64 {
 	tb.Helper()

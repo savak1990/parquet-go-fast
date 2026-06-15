@@ -4,8 +4,7 @@
 // Workloads mirror the standard parquet-reader benchmark cases: full row
 // materialization, column projection, and predicate-filtered scans. The Go
 // benchmarks here compare this library against parquet-go's reflection-based
-// GenericReader; the engine comparisons (DuckDB / ClickHouse / pyarrow) live in
-// ../sql and ../run.sh.
+// GenericReader; the engine comparisons (DuckDB / ClickHouse) live in ../sql.
 package bench
 
 import (
