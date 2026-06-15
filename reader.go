@@ -1,15 +1,24 @@
 package parquetfast
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"reflect"
 	"sync"
 	"unsafe"
 
 	"github.com/parquet-go/parquet-go"
 )
+
+// Stream helpers default to this batch size when the caller passes <= 0.
+const defaultStreamBatch = 4096
+
+// streamChanBuffer is the look-ahead depth of Chan's channel (in batches): the
+// producer may decode this many batches ahead of the consumer.
+const streamChanBuffer = 2
 
 // Reader streams rows of a parquet file into caller-sized batches of []T,
 // reusing the destination across calls. Prefer it over Unmarshal for large
@@ -338,6 +347,125 @@ func (rd *Reader[T]) Read(dst []T) (int, error) {
 	}
 
 	return n, nil
+}
+
+// All returns an iterator over the file's rows, in file order, yielded in
+// batches of up to batchSize. It is the range-over-func form of Read for a
+// single, in-process consumer:
+//
+//	for batch, err := range rd.All(4096) {
+//	    if err != nil {
+//	        return err
+//	    }
+//	    for i := range batch {
+//	        handle(batch[i])
+//	    }
+//	}
+//
+// The yielded slice is owned by the Reader and reused on the next iteration, so
+// copy any element you need to keep past the current step. Iteration ends at end
+// of file with no error; on a read error it yields that error once and stops.
+// batchSize <= 0 uses a default of 4096. With WithConcurrency the underlying
+// decode runs in parallel, but batches are still delivered in file order. Use
+// Chan instead when you want the decode to overlap a slow consumer across a
+// goroutine boundary.
+func (rd *Reader[T]) All(batchSize int) iter.Seq2[[]T, error] {
+	if batchSize <= 0 {
+		batchSize = defaultStreamBatch
+	}
+
+	return func(yield func([]T, error) bool) {
+		buf := make([]T, batchSize)
+
+		for {
+			n, err := rd.Read(buf)
+			if n > 0 && !yield(buf[:n], nil) {
+				return
+			}
+
+			if errors.Is(err, io.EOF) {
+				return
+			}
+
+			if err != nil {
+				yield(nil, err)
+
+				return
+			}
+		}
+	}
+}
+
+// Chan starts a background producer that decodes the file and sends its rows, in
+// file order, on the returned channel in batches of up to batchSize. It is the
+// concurrent-producer form of Read: decoding overlaps the consumer's work across
+// a goroutine boundary, which suits streaming a large file into a slower consumer
+// (a database, a network sink). For a plain in-process loop use All.
+//
+//	ch, wait := rd.Chan(ctx, 4096)
+//	for batch := range ch {
+//	    for i := range batch {
+//	        handle(batch[i])
+//	    }
+//	}
+//	if err := wait(); err != nil {
+//	    return err
+//	}
+//
+// Each batch is a freshly allocated slice owned by the consumer (safe to retain).
+// The channel is closed at end of file or on the first error; wait blocks until
+// the producer has stopped and returns that error (nil on a clean EOF). Cancel
+// ctx to stop early — the caller must drain the channel or cancel ctx, or the
+// producer goroutine will block forever on a full channel and leak. batchSize <= 0
+// uses a default of 4096. With WithConcurrency the decode is parallel, but
+// delivery stays in file order.
+func (rd *Reader[T]) Chan(ctx context.Context, batchSize int) (<-chan []T, func() error) {
+	if batchSize <= 0 {
+		batchSize = defaultStreamBatch
+	}
+
+	out := make(chan []T, streamChanBuffer)
+	done := make(chan struct{})
+
+	var ferr error
+
+	go func() {
+		defer close(done) // closes after out, so wait() returning implies out closed
+		defer close(out)
+
+		for {
+			buf := make([]T, batchSize) // fresh each time: the batch escapes to the consumer
+
+			n, err := rd.Read(buf)
+			if n > 0 {
+				select {
+				case out <- buf[:n]:
+				case <-ctx.Done():
+					ferr = ctx.Err()
+
+					return
+				}
+			}
+
+			if errors.Is(err, io.EOF) {
+				return
+			}
+
+			if err != nil {
+				ferr = err
+
+				return
+			}
+		}
+	}()
+
+	wait := func() error {
+		<-done
+
+		return ferr
+	}
+
+	return out, wait
 }
 
 // Close releases the underlying row reader.

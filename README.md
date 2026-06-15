@@ -53,7 +53,11 @@ rows, err := parquetfast.Unmarshal[Row](r, size)            // any io.ReaderAt
 
 ### Stream large files (bounded memory)
 
-Reuse a destination buffer instead of holding the whole `[]T`:
+A `Reader` decodes in caller-sized batches instead of holding the whole `[]T`, so
+memory stays bounded regardless of file size. Three ways to consume it, lowest- to
+highest-level:
+
+**`Read` — fill a reused buffer** (the primitive):
 
 ```go
 rd, err := parquetfast.NewReader[Row](f, size)
@@ -68,6 +72,32 @@ for {
     if err != nil { return err }
 }
 ```
+
+**`All` — range over batches** (Go 1.23 iterator; one in-process consumer):
+
+```go
+for batch, err := range rd.All(4096) {
+    if err != nil { return err }
+    for i := range batch { process(batch[i]) }
+}
+```
+
+The yielded slice is reused on the next iteration — copy any element you keep.
+
+**`Chan` — a background producer** (decode overlaps a slower consumer — a DB, a
+network sink — across a goroutine boundary):
+
+```go
+ch, wait := rd.Chan(ctx, 4096)
+for batch := range ch {        // each batch is freshly allocated, safe to retain
+    for i := range batch { process(batch[i]) }
+}
+if err := wait(); err != nil { return err } // terminal error (nil on clean EOF)
+```
+
+Cancel `ctx` to stop early. All three deliver rows **in file order**, and all
+compose with `WithConcurrency` — the decode then runs across row groups in parallel
+while delivery stays ordered (see [Decode across cores](#decode-across-cores)).
 
 ### Read only some columns (projection)
 
