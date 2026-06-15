@@ -203,7 +203,9 @@ arrow-go 5.8 GB · parquet-go 4.2 GB.
   buffer (views), while we copy each value into an independent, GC-safe Go string
   (~1 alloc/value). A real trade-off.
 - The **string filter takes the row path** (string predicate ≠ numeric columnar
-  filter); ~1.7× behind DuckDB. **Concurrency barely helps** (alloc/GC-bound).
+  filter); ~1.7× behind DuckDB. **Concurrency gives no gain — this file has a single
+  row group** (all 994,896 rows in one), so there's nothing for `WithConcurrency` to
+  fan out (cf. taxi 3 / dbpedia 39 / structwiki 87 row groups → 2.6–9×).
 
 ## Results — dbpedia embeddings (nested list; `-benchtime=5x`)
 

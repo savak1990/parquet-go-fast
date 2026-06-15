@@ -171,7 +171,7 @@ type OpenOrca struct {
 | Reader | Returns | Time | Mem | Alloc | Note |
 |---|---|--:|--:|--:|---|
 | **parquet-go-fast** | Go `[]struct` | **962 ms** | 1.1 GB | 2.0 M | |
-| parquet-go-fast (concurrent) | Go `[]struct` | 974 ms | 1.1 GB | 2.0 M | no gain (string-bound) |
+| parquet-go-fast (concurrent) | Go `[]struct` | 974 ms | 1.1 GB | 2.0 M | no gain (1 row group) |
 | DuckDB → Go | Go `[]struct` | 1001 ms | 2.3 GB ⚠️ | 8.0 M | cgo mem under-counted |
 | arrow-go → rows | Arrow→`[]struct` | 1011 ms | 2.9 GB | 13 k | string views |
 | parquet-go | Go `[]struct` | 1154 ms | 2.3 GB | 5.0 M | |
@@ -182,7 +182,7 @@ type OpenOrca struct {
 |---|---|--:|--:|--:|---|
 | **DuckDB → Go** | Go `[]struct` | **544 ms** | 512 MB ⚠️ | 1.8 M | predicate pushdown |
 | parquet-go-fast | Go `[]struct` | 920 ms | 1.4 GB | 454 k | |
-| parquet-go-fast (concurrent) | Go `[]struct` | 928 ms | 1.4 GB | 454 k | no gain (string-bound) |
+| parquet-go-fast (concurrent) | Go `[]struct` | 928 ms | 1.4 GB | 454 k | no gain (1 row group) |
 | arrow-go | — | — | — | — | no predicate-pushdown reader |
 | parquet-go | Go `[]struct` | 2167 ms | 4.2 GB | 6.9 M | |
 
@@ -200,8 +200,11 @@ type OpenOrca struct {
   *time* as the comparable figure.
 - **String filters take the row path** (string predicate ≠ the numeric columnar
   filter); ~1.7× behind DuckDB's pushdown — far closer than numeric filters once were.
-- **Concurrency barely helps here** — string materialization is allocation/GC-bound,
-  not CPU-bound, so the worker goroutines just contend on the allocator.
+- **Concurrency gives nothing here — the file has one row group.** `WithConcurrency`
+  fans *row groups* across workers; this file (written by `parquet-cpp-arrow`) packs
+  all 994,896 rows into a single row group, so there's nothing to split and it runs
+  single-core. The other datasets (taxi 3, dbpedia 39, structwiki 87 row groups) get
+  2.6–9× from concurrency.
 
 ### dbpedia embeddings — nested list + strings (HuggingFace)
 
