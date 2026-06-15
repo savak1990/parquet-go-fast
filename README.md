@@ -31,7 +31,9 @@ native row collection**. Reproduce and read the methodology in [`bench/`](bench/
 > otherwise write yourself. **DuckDB→Go** goes through `database/sql` (per-cell
 > `Scan`); **PyArrow** is a different runtime (Python objects).
 
-**Full read — all 19 columns → rows**
+**Full read — all 19 columns → rows.** Read every row and column into records.
+The Go readers and DuckDB→Go return a `[]struct`; arrow-go returns columnar Arrow
+arrays (no per-row objects, so it does strictly less work), shown for reference.
 
 | Reader | Returns | Time |
 |---|---|---:|
@@ -41,7 +43,9 @@ native row collection**. Reproduce and read the methodology in [`bench/`](bench/
 | DuckDB → Go | Go `[]struct` | 2138 ms |
 | parquet-go | Go `[]struct` | 3061 ms |
 
-**Projection — N of 19 columns → rows**
+**Projection — N of 19 columns → rows.** Read only N columns (a struct with just
+those fields) — tests how well a reader avoids touching the rest. `arrow-go → rows`
+reads N columns into Arrow then transposes to structs (that transpose is in its time).
 
 | Columns | parquet-go-fast | arrow-go → rows | DuckDB → Go | parquet-go |
 |---|---:|---:|---:|---:|
@@ -49,7 +53,9 @@ native row collection**. Reproduce and read the methodology in [`bench/`](bench/
 | 5 | **49 ms** | 82 ms | 501 ms | 1968 ms |
 | 10 | **98 ms** | 186 ms | 925 ms | 2205 ms |
 
-**Filter — predicate → matching rows**
+**Filter — predicate → matching rows.** Apply a `WHERE` and return only the matches.
+parquet-go has no pushdown (decode all rows, filter in Go); DuckDB and PyArrow push
+the predicate down. arrow-go has no pushdown reader, so it isn't listed here.
 
 | Predicate (matches) | parquet-go-fast | DuckDB → Go | PyArrow | parquet-go |
 |---|---:|---:|---:|---:|
