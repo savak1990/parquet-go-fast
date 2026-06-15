@@ -174,14 +174,29 @@ therefore scales with the **number of row groups** — a single-row-group file c
 split and runs sequentially. It requires a concurrency-safe `io.ReaderAt`;
 `UnmarshalFile` and `UnmarshalBytes` both qualify.
 
-**Skip work before decoding it.** Column projection touches only the bound columns;
-predicate pushdown prunes whole row groups and pages (min/max stats, sorted-column
-binary search, bloom filters) before anything is decoded. A filtered read of a
-scalar-only struct reuses the columnar path: it decodes the output columns once,
-evaluates the predicate over the **already-decoded** values (the filter column is
-never read twice), keeps the matches, and parallelizes across row groups too.
-Heavily-pruned scans on sorted columns instead use a row-at-a-time path that seeks
-over the skipped pages.
+**Skip work before decoding it — pruning at three levels.** A read does only the I/O
+and decode the query actually needs:
+
+- **Column** (projection) — only the columns bound to struct fields (plus any columns
+  named in a predicate) are fetched, decompressed, and decoded; the rest of the file
+  is never touched.
+- **Row group** — each row group's min/max column statistics and bloom filters are
+  tested against the predicate, and groups that can't contain a match are skipped
+  whole.
+- **Page** — within a surviving row group, per-page min/max statistics skip the data
+  pages that can't match (a sorted column is binary-searched), so off-range pages are
+  never read.
+
+**Predicate filtering.** `Where(...)` builds a predicate tree — `Equal`, `Less`,
+`Between`, `In`, … combined with `And`/`Or`/`Not` — whose leaves drive the pruning
+above (a predicate column need not be a field of your struct). Rows that survive
+pruning still need a row-level check: for a **scalar-only** output the filtered read
+reuses the columnar path — it decodes the output columns once and evaluates the
+predicate over the **already-decoded** values (so the filter column is never read
+twice), keeps the matches, and parallelizes across row groups. A heavily-pruned scan
+on a sorted column instead falls to a row-at-a-time path that seeks over the skipped
+pages; anything else (string/bytes/`time.Time`/unsigned predicates, or compound
+output) uses the row reader and filters as it goes.
 
 ## Performance
 
